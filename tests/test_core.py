@@ -31,7 +31,7 @@ class CoreModulesTest(unittest.TestCase):
             self.assertIsNotNone(risk)
             self.assertAlmostEqual(risk["max_single_position_pct"], 0.20)
             self.assertEqual(risk["max_orders_per_hour"], 3)
-            self.assertEqual(schedules["cnt"], 5)
+            self.assertEqual(schedules["cnt"], 6)
         finally:
             conn.close()
 

@@ -1,7 +1,9 @@
-"""MVP 網站後端服務：支援真實市場 (Yahoo Finance) 與模擬市場雙軌切換、驗證、風控與回測。"""
+"""MVP 網站後端服務：支援真實市場 (Yahoo Finance)、台股全類別行情、雙軌切換與排程自動更新。"""
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import sys
 import threading
@@ -11,10 +13,11 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from app.adapters.mock import DEFAULT_WATCHLIST, MockMarketAdapter
 from app.adapters.yahoo import YahooFinanceAdapter
+from app.adapters.yahoo_class import YahooClassScraper
 from app.core.broker import check_stop_triggers, execute_order, get_latest_prices, get_portfolio, preview_order
 from app.core.reality_check import evaluate_strategy_accuracy
 from app.core.risk_guard import OrderRequest
@@ -45,7 +48,7 @@ STATIC_FILES: dict[str, tuple[str, str]] = {
 
 
 class AppService:
-    """網站應用服務核心：協調雙軌資料源、排程器與模擬交易風控。"""
+    """網站應用服務核心：協調雙軌資料源、台股全類別爬蟲、排程器與模擬交易風控。"""
 
     def __init__(
         self,
@@ -54,12 +57,24 @@ class AppService:
         adapter_seed: int | None = None,
         default_source: str = "yahoo",
         yahoo_adapter: YahooFinanceAdapter | None = None,
+        class_scraper: YahooClassScraper | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.mock_adapter = MockMarketAdapter(seed=adapter_seed)
         self.yahoo_adapter = yahoo_adapter or YahooFinanceAdapter()
+        self.class_scraper = class_scraper or YahooClassScraper()
         self.scheduler = TaskScheduler(self.db_path)
         self._lock = threading.Lock()
+        self._sync_lock = threading.Lock()
+        self._sync_state: dict[str, Any] = {
+            "running": False,
+            "synced_categories": 0,
+            "total_categories": 0,
+            "total_quote_rows": 0,
+            "failed_categories": 0,
+            "last_finished_at": None,
+            "last_error": None,
+        }
         self.active_source = default_source if default_source in SOURCE_LABELS else "mock"
         self.last_source_notice: str | None = None
 
@@ -87,6 +102,11 @@ class AppService:
         self.scheduler.register_job(
             "generate_daily_report", self.job_generate_report,
             job_type="daily_report", cron_expr="0 15 * * 1-5", max_retries=1, description="產出每日盤後小白白話日報",
+        )
+        self.scheduler.register_job(
+            "sync_yahoo_classes", self.job_sync_classes,
+            job_type="sync_classes", cron_expr="*/15 9-14 * * 1-5", max_retries=2,
+            description="每日盤中與盤後同步 Yahoo 台股全類別與即時報價",
         )
 
     def _seed_mock_if_empty(self, conn: Any) -> None:
@@ -123,7 +143,6 @@ class AppService:
                             if issues:
                                 self.last_source_notice = f"真實行情已載入，部分標的異常：{issues[0]}"
                             return
-                        # 無法連線或查無有效真實報價時安全降級為模擬市場
                         self.active_source = "mock"
                         self.last_source_notice = "目前無法連線至 Yahoo Finance 真實行情，已自動切換為模擬市場模式。"
                         self._seed_mock_if_empty(conn)
@@ -200,6 +219,194 @@ class AppService:
 
                 err_msg = "；".join(f"{i.symbol}: {i.reason}" for i in validation.issues) if validation.issues else None
                 return (validation.status, saved, err_msg)
+            finally:
+                conn.close()
+
+    def job_sync_classes(self) -> tuple[str, int, str | None]:
+        """同步 Yahoo 台股全類別與即時報價並更新進度狀態。"""
+        with self._sync_lock:
+            if self._sync_state["running"]:
+                return ("PARTIAL", 0, "已有全類別同步任務進行中")
+            self._sync_state.update(
+                {
+                    "running": True,
+                    "synced_categories": 0,
+                    "total_categories": 0,
+                    "total_quote_rows": 0,
+                    "failed_categories": 0,
+                    "last_error": None,
+                }
+            )
+
+        def on_progress(done: int, total: int, rows: int) -> None:
+            with self._sync_lock:
+                self._sync_state["synced_categories"] = done
+                self._sync_state["total_categories"] = total
+                self._sync_state["total_quote_rows"] = rows
+
+        try:
+            summary = self.class_scraper.sync_all_categories(self.db_path, progress_cb=on_progress)
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            err_msg = "；".join(summary["errors"][:3]) if summary["errors"] else None
+            with self._sync_lock:
+                self._sync_state.update(
+                    {
+                        "running": False,
+                        "synced_categories": summary["synced_categories"],
+                        "total_categories": summary["total_categories"],
+                        "total_quote_rows": summary["total_quote_rows"],
+                        "failed_categories": summary["failed_categories"],
+                        "last_finished_at": now_iso,
+                        "last_error": err_msg,
+                    }
+                )
+            status = "SUCCESS" if summary["failed_categories"] == 0 else ("PARTIAL" if summary["synced_categories"] > 0 else "FAILED")
+            return (status, int(summary["total_quote_rows"]), err_msg)
+        except Exception as exc:
+            with self._sync_lock:
+                self._sync_state.update(
+                    {
+                        "running": False,
+                        "last_error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            raise
+
+    def start_async_class_sync(self) -> tuple[bool, dict[str, Any]]:
+        """非同步觸發全類別同步（給網頁按鈕呼叫，不阻塞 HTTP 回應）。"""
+        with self._sync_lock:
+            if self._sync_state["running"]:
+                return False, dict(self._sync_state)
+
+        threading.Thread(target=self.scheduler.rerun_job, args=("sync_yahoo_classes",), daemon=True).start()
+        return True, self.get_class_sync_status()
+
+    def get_class_sync_status(self) -> dict[str, Any]:
+        with self._sync_lock:
+            return dict(self._sync_state)
+
+    def get_classes(self, *, group: str = "", q: str = "") -> dict[str, Any]:
+        """查詢台股全類別目錄、各分組計數與統計摘要。"""
+        with self._lock:
+            conn = get_connection(self.db_path)
+            try:
+                clauses: list[str] = []
+                params: list[Any] = []
+                if group:
+                    clauses.append("group_type = ?")
+                    params.append(group)
+                if q:
+                    clauses.append("(name LIKE ? OR category_key LIKE ?)")
+                    like_q = f"%{q}%"
+                    params.extend([like_q, like_q])
+                where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+                rows = conn.execute(
+                    f"""
+                    SELECT category_key, group_type, name, sector_id, exchange,
+                           stock_count, avg_change_pct, up_count, down_count, updated_at
+                    FROM yahoo_categories
+                    {where}
+                    ORDER BY group_type, stock_count DESC, name;
+                    """,
+                    params,
+                ).fetchall()
+
+                grp_rows = conn.execute(
+                    "SELECT group_type, COUNT(*) AS cnt FROM yahoo_categories GROUP BY group_type;"
+                ).fetchall()
+                max_row = conn.execute("SELECT MAX(updated_at) AS max_u FROM yahoo_categories;").fetchone()
+                quote_cnt = conn.execute("SELECT COUNT(DISTINCT symbol) AS u_sym, COUNT(*) AS total_rows FROM yahoo_category_quotes;").fetchone()
+
+                return {
+                    "categories": [dict(r) for r in rows],
+                    "group_counts": {r["group_type"]: int(r["cnt"]) for r in grp_rows},
+                    "unique_symbols": int(quote_cnt["u_sym"]) if quote_cnt else 0,
+                    "total_quote_rows": int(quote_cnt["total_rows"]) if quote_cnt else 0,
+                    "last_updated_at": max_row["max_u"] if max_row else None,
+                    "sync_status": self.get_class_sync_status(),
+                }
+            finally:
+                conn.close()
+
+    def get_category_quotes(self, category_key: str, *, q: str = "") -> dict[str, Any]:
+        """查詢指定類別的成分股即時報價。"""
+        with self._lock:
+            conn = get_connection(self.db_path)
+            try:
+                cat = conn.execute(
+                    "SELECT * FROM yahoo_categories WHERE category_key = ?;",
+                    (category_key,),
+                ).fetchone()
+                if cat is None:
+                    raise KeyError(f"找不到類別：{category_key}")
+
+                params: list[Any] = [category_key]
+                filter_sql = ""
+                if q:
+                    filter_sql = "AND (symbol LIKE ? OR symbol_name LIKE ?)"
+                    params.extend([f"%{q}%", f"%{q}%"])
+
+                rows = conn.execute(
+                    f"""
+                    SELECT symbol, symbol_name, exchange, price, change, change_pct, change_status,
+                           open, high, low, prev_close, volume, turnover_m, limit_up, limit_down,
+                           market_status, quote_time
+                    FROM yahoo_category_quotes
+                    WHERE category_key = ? {filter_sql}
+                    ORDER BY (change_pct IS NULL) ASC, change_pct DESC, turnover_m DESC;
+                    """,
+                    params,
+                ).fetchall()
+                return {
+                    "category": dict(cat),
+                    "quotes": [dict(r) for r in rows],
+                }
+            finally:
+                conn.close()
+
+    def export_classes_csv(self, *, category_key: str = "", group: str = "") -> bytes:
+        """將類別與即時報價匯出為 UTF-8-SIG CSV（Excel 可直接開起不亂碼）。"""
+        with self._lock:
+            conn = get_connection(self.db_path)
+            try:
+                clauses: list[str] = []
+                params: list[Any] = []
+                if category_key:
+                    clauses.append("c.category_key = ?")
+                    params.append(category_key)
+                if group:
+                    clauses.append("c.group_type = ?")
+                    params.append(group)
+                where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+                rows = conn.execute(
+                    f"""
+                    SELECT c.group_type, c.name AS category_name, q.symbol, q.symbol_name,
+                           q.exchange, q.price, q.change, q.change_pct, q.open, q.high, q.low,
+                           q.prev_close, q.volume, q.turnover_m, q.limit_up, q.limit_down, q.quote_time
+                    FROM yahoo_category_quotes q
+                    INNER JOIN yahoo_categories c ON q.category_key = c.category_key
+                    {where}
+                    ORDER BY c.group_type, c.name, q.change_pct DESC;
+                    """,
+                    params,
+                ).fetchall()
+
+                buf = io.StringIO()
+                writer = csv.writer(buf)
+                writer.writerow([
+                    "分組", "類別名稱", "股票代碼", "股票名稱", "市場", "成交價", "漲跌",
+                    "漲跌幅(%)", "開盤", "最高", "最低", "昨收", "成交量(股)", "成交值(百萬)", "漲停", "跌停", "報價時間(UTC)",
+                ])
+                for r in rows:
+                    writer.writerow([
+                        r["group_type"], r["category_name"], r["symbol"], r["symbol_name"],
+                        r["exchange"], r["price"], r["change"], r["change_pct"],
+                        r["open"], r["high"], r["low"], r["prev_close"],
+                        r["volume"], r["turnover_m"], r["limit_up"], r["limit_down"], r["quote_time"],
+                    ])
+                return buf.getvalue().encode("utf-8-sig")
             finally:
                 conn.close()
 
@@ -340,6 +547,8 @@ def create_server(
     adapter_seed: int | None = None,
     default_source: str = "yahoo",
     yahoo_adapter: YahooFinanceAdapter | None = None,
+    class_scraper: YahooClassScraper | None = None,
+    start_scheduler: bool = False,
 ) -> ThreadingHTTPServer:
     """建立可立即啟動的 MVP HTTP 伺服器。"""
     # shortcut: 使用 Python 內建 ThreadingHTTPServer 零依賴啟動 MVP 網站；未來若需高併發、JWT 或 OpenAPI 文件再升級為 FastAPI
@@ -348,7 +557,10 @@ def create_server(
         adapter_seed=adapter_seed,
         default_source=default_source,
         yahoo_adapter=yahoo_adapter,
+        class_scraper=class_scraper,
     )
+    if start_scheduler:
+        service.scheduler.start_builtin_loop()
     static_root = STATIC_DIR.resolve()
 
     class AppHandler(BaseHTTPRequestHandler):
@@ -375,7 +587,10 @@ def create_server(
             return parsed
 
         def do_GET(self) -> None:  # noqa: N802
-            path = urlparse(self.path).path
+            parsed_url = urlparse(self.path)
+            path = parsed_url.path
+            query = parse_qs(parsed_url.query)
+
             if path in STATIC_FILES:
                 filename, ctype = STATIC_FILES[path]
                 target = (static_root / filename).resolve()
@@ -398,6 +613,33 @@ def create_server(
                 return
             if path == "/api/schedules":
                 self._send_json(HTTPStatus.OK, service.get_schedules())
+                return
+            if path == "/api/classes":
+                group = (query.get("group") or [""])[0].strip()
+                q = (query.get("q") or [""])[0].strip()
+                self._send_json(HTTPStatus.OK, service.get_classes(group=group, q=q))
+                return
+            if path == "/api/classes/sync-status":
+                self._send_json(HTTPStatus.OK, service.get_class_sync_status())
+                return
+            if path == "/api/classes/export.csv":
+                cat_key = (query.get("category_key") or [""])[0].strip()
+                group = (query.get("group") or [""])[0].strip()
+                csv_bytes = service.export_classes_csv(category_key=cat_key, group=group)
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Disposition", 'attachment; filename="tw_stock_classes.csv"')
+                self.send_header("Content-Length", str(len(csv_bytes)))
+                self.end_headers()
+                self.wfile.write(csv_bytes)
+                return
+            if path.startswith("/api/classes/") and path.endswith("/quotes"):
+                cat_key = unquote(path[len("/api/classes/"):-len("/quotes")]).strip("/")
+                q = (query.get("q") or [""])[0].strip()
+                try:
+                    self._send_json(HTTPStatus.OK, service.get_category_quotes(cat_key, q=q))
+                except KeyError as exc:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
                 return
 
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "找不到指定路徑"})
@@ -426,6 +668,11 @@ def create_server(
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
+
+            if path == "/api/classes/sync":
+                started, state = service.start_async_class_sync()
+                self._send_json(HTTPStatus.OK, {"started": started, "sync_status": state})
+                return
 
             if path == "/api/source":
                 try:
@@ -506,18 +753,22 @@ def create_server(
 
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "找不到指定路徑"})
 
-    return ThreadingHTTPServer((host, port), AppHandler)
+    server = ThreadingHTTPServer((host, port), AppHandler)
+    # 掛載 service 引用以便關閉時停止排程迴圈
+    server.app_service = service  # type: ignore[attr-defined]
+    return server
 
 
 def main() -> None:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
-    server = create_server(port=port, default_source="yahoo")
-    print(f"安心股伴 StockMate 網站已啟動：http://127.0.0.1:{port}", flush=True)
+    server = create_server(port=port, default_source="yahoo", start_scheduler=True)
+    print(f"安心股伴 StockMate 網站已啟動：http://127.0.0.1:{port}（已啟用每日 Cron 自動排程）", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        server.app_service.scheduler.stop_builtin_loop()  # type: ignore[attr-defined]
         server.server_close()
 
 

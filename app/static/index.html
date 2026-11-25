@@ -59,6 +59,7 @@
     <!-- 頁籤導覽 -->
     <nav class="tabs" role="tablist" aria-label="功能分頁">
       <button class="tab-btn active" data-tab="tab-market" type="button">市場與白話建議</button>
+      <button class="tab-btn" data-tab="tab-classes" type="button">台股全類別行情</button>
       <button class="tab-btn" data-tab="tab-trade" type="button">模擬下單與持倉</button>
       <button class="tab-btn" data-tab="tab-forecast" type="button">條件情境模擬</button>
       <button class="tab-btn" data-tab="tab-scheduler" type="button">排程與執行日誌</button>
@@ -79,6 +80,55 @@
       </article>
 
       <div id="stock-grid" class="stock-grid"></div>
+    </section>
+
+    <!-- 分頁 1.5：台股全類別行情 -->
+    <section id="tab-classes" class="tab-panel">
+      <article class="panel-card" style="margin-bottom: 16px;">
+        <div class="panel-head-inline">
+          <div>
+            <h2>Yahoo 台股全類別即時行情</h2>
+            <p id="classes-summary" class="panel-desc">載入中...</p>
+          </div>
+          <div class="topbar-actions">
+            <a id="btn-export-csv" class="btn btn-outline" href="/api/classes/export.csv">匯出 CSV</a>
+            <button id="btn-sync-classes" class="btn btn-primary" type="button">立即同步全類別</button>
+          </div>
+        </div>
+        <div class="classes-toolbar">
+          <div id="class-group-pills" class="action-chips"></div>
+          <input id="class-search" type="search" placeholder="搜尋類別名稱（如 半導體、AI、台積電）..." />
+        </div>
+        <p id="classes-sync-msg" class="feedback-msg"></p>
+      </article>
+
+      <div class="classes-split">
+        <article class="panel-card classes-list-panel">
+          <h3>分類清單</h3>
+          <div id="class-list" class="class-list"></div>
+        </article>
+        <article class="panel-card">
+          <div class="panel-head-inline">
+            <h3 id="selected-class-title">請選擇左側分類</h3>
+            <input id="quote-search" type="search" placeholder="篩選股名 / 代號..." style="max-width: 210px;" />
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>代號 / 名稱</th>
+                  <th>成交價</th>
+                  <th>漲跌 / 幅度</th>
+                  <th>開 / 高 / 低 / 昨收</th>
+                  <th>量(張) / 成交值(M)</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="class-quotes-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </div>
     </section>
 
     <!-- 分頁 2：模擬下單與持倉 -->

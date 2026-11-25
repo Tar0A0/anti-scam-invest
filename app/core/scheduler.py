@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from app.db.database import get_connection
 
 JobCallable = Callable[[], int | tuple[str, int, str | None]]
+TAIPEI_TZ = timezone(timedelta(hours=8))
 
 
 def _utc_now_iso() -> str:
@@ -22,6 +24,63 @@ def _validate_cron_expr(expr: str) -> None:
     parts = expr.strip().split()
     if len(parts) != 5:
         raise ValueError(f"Cron 表達式必須剛好包含 5 個欄位（分 時 日 月 週），收到：{expr!r}")
+
+
+def _cron_field_matches(field: str, value: int, min_val: int, max_val: int, *, is_dow: bool = False) -> bool:
+    """解析單一 Cron 欄位（支援 *, */n, a-b, a-b/n 與逗號清單）。"""
+    for token in field.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "/" in token:
+            base, step_str = token.split("/", 1)
+            step = int(step_str)
+            if step <= 0:
+                return False
+        else:
+            base, step = token, 1
+
+        if base == "*":
+            start, end = min_val, max_val
+        elif "-" in base:
+            a_str, b_str = base.split("-", 1)
+            start, end = int(a_str), int(b_str)
+        else:
+            exact = int(base)
+            if is_dow and exact == 7:
+                exact = 0
+            if value == exact:
+                return True
+            continue
+
+        if is_dow and end == 7:
+            # 支援 0-7 或 1-7 表示含週日
+            if value == 0 and (start == 0 or end == 7):
+                return True
+            end = 6
+        if start <= value <= end and (value - start) % step == 0:
+            return True
+    return False
+
+
+def cron_matches(expr: str, dt: datetime) -> bool:
+    """檢查指定時間是否符合 5 欄 Cron 表達式（週日為 0 或 7，週一至週六為 1~6）。"""
+    parts = expr.strip().split()
+    if len(parts) != 5:
+        return False
+    minute_f, hour_f, dom_f, month_f, dow_f = parts
+    # Python weekday(): Mon=0..Sun=6 -> Cron dow: Sun=0, Mon=1..Sat=6
+    cron_dow = (dt.weekday() + 1) % 7
+    try:
+        return (
+            _cron_field_matches(minute_f, dt.minute, 0, 59)
+            and _cron_field_matches(hour_f, dt.hour, 0, 23)
+            and _cron_field_matches(dom_f, dt.day, 1, 31)
+            and _cron_field_matches(month_f, dt.month, 1, 12)
+            and _cron_field_matches(dow_f, cron_dow, 0, 6, is_dow=True)
+        )
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -44,6 +103,9 @@ class TaskScheduler:
         self.db_path = Path(db_path)
         self._jobs: dict[str, JobCallable] = {}
         self._bg_scheduler: Any = None
+        self._loop_stop = threading.Event()
+        self._loop_thread: threading.Thread | None = None
+        self._last_fired_minute: dict[str, str] = {}
 
     def register_job(
         self,
@@ -266,3 +328,52 @@ class TaskScheduler:
         if self._bg_scheduler is not None and self._bg_scheduler.running:
             self._bg_scheduler.shutdown(wait=False)
             self._bg_scheduler = None
+
+    def start_builtin_loop(self, *, poll_interval_sec: float = 20.0) -> None:
+        """啟動零依賴內建 Cron 排程迴圈（台北時間 UTC+8），隨網站常駐自動執行。"""
+        # shortcut: 內建純 Python 單進程 Cron 排程迴圈（UTC+8），隨網站啟動自動執行每日與盤中即時更新；關機或停服時可改以 Windows 工作排程器執行 python -m app.adapters.yahoo_class
+        if self._loop_thread is not None and self._loop_thread.is_alive():
+            return
+
+        self._loop_stop.clear()
+
+        def _loop() -> None:
+            while not self._loop_stop.is_set():
+                now_tpe = datetime.now(TAIPEI_TZ)
+                minute_key = now_tpe.strftime("%Y-%m-%d %H:%M")
+                try:
+                    conn = get_connection(self.db_path)
+                    try:
+                        configs = conn.execute(
+                            "SELECT job_name, cron_expr FROM schedule_configs WHERE enabled = 1;"
+                        ).fetchall()
+                    finally:
+                        conn.close()
+
+                    for cfg in configs:
+                        job_name = cfg["job_name"]
+                        if job_name not in self._jobs:
+                            continue
+                        if self._last_fired_minute.get(job_name) == minute_key:
+                            continue
+                        if cron_matches(cfg["cron_expr"], now_tpe):
+                            self._last_fired_minute[job_name] = minute_key
+                            threading.Thread(
+                                target=self.run_job,
+                                args=(job_name, "scheduled"),
+                                daemon=True,
+                            ).start()
+                except Exception:  # noqa: BLE001 - 排程守護迴圈不可因單次讀取失敗而終止
+                    pass
+
+                self._loop_stop.wait(poll_interval_sec)
+
+        self._loop_thread = threading.Thread(target=_loop, daemon=True)
+        self._loop_thread.start()
+
+    def stop_builtin_loop(self) -> None:
+        """停止內建 Cron 排程迴圈。"""
+        self._loop_stop.set()
+        if self._loop_thread is not None:
+            self._loop_thread.join(timeout=2)
+            self._loop_thread = None

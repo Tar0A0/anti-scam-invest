@@ -25,7 +25,7 @@ CREATE INDEX IF NOT EXISTS idx_market_quotes_symbol_time
 CREATE TABLE IF NOT EXISTS schedule_configs (
     job_name    TEXT    PRIMARY KEY,                -- 任務唯一識別名稱
     job_type    TEXT    NOT NULL CHECK (
-        job_type IN ('fetch_pre', 'fetch_intraday', 'fetch_post', 'strategy', 'daily_report')
+        job_type IN ('fetch_pre', 'fetch_intraday', 'fetch_post', 'strategy', 'daily_report', 'sync_classes')
     ),
     cron_expr   TEXT    NOT NULL,                   -- 標準 5 欄 Cron 表達式（分 時 日 月 週）
     enabled     INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
@@ -122,4 +122,62 @@ CREATE TABLE IF NOT EXISTS account_state (
     cash_balance       REAL    NOT NULL DEFAULT 1000000.0 CHECK (cash_balance >= 0),
     daily_realized_pnl REAL    NOT NULL DEFAULT 0.0,
     updated_at         TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+-- 10. Yahoo 台股全類別目錄與統計摘要表（上市/上櫃/興櫃/概念股/集團股/電子產業）
+CREATE TABLE IF NOT EXISTS yahoo_categories (
+    category_key   TEXT    PRIMARY KEY,
+    group_type     TEXT    NOT NULL,
+    name           TEXT    NOT NULL,
+    sector_id      TEXT,
+    exchange       TEXT,
+    category_param TEXT,
+    category_label TEXT,
+    stock_count    INTEGER NOT NULL DEFAULT 0,
+    avg_change_pct REAL,
+    up_count       INTEGER NOT NULL DEFAULT 0,
+    down_count     INTEGER NOT NULL DEFAULT 0,
+    updated_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+-- 11. Yahoo 台股各類別即時成分股報價表
+CREATE TABLE IF NOT EXISTS yahoo_category_quotes (
+    category_key  TEXT    NOT NULL,
+    symbol        TEXT    NOT NULL,
+    symbol_name   TEXT    NOT NULL,
+    exchange      TEXT,
+    price         REAL,
+    change        REAL,
+    change_pct    REAL,
+    change_status TEXT,
+    open          REAL,
+    high          REAL,
+    low           REAL,
+    prev_close    REAL,
+    volume        INTEGER NOT NULL DEFAULT 0,
+    turnover_m    REAL,
+    limit_up      INTEGER NOT NULL DEFAULT 0 CHECK (limit_up IN (0, 1)),
+    limit_down    INTEGER NOT NULL DEFAULT 0 CHECK (limit_down IN (0, 1)),
+    market_status TEXT,
+    quote_time    TEXT,
+    updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (category_key, symbol),
+    FOREIGN KEY (category_key) REFERENCES yahoo_categories (category_key) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_yahoo_cat_quotes_key ON yahoo_category_quotes (category_key);
+CREATE INDEX IF NOT EXISTS idx_yahoo_cat_quotes_sym ON yahoo_category_quotes (symbol);
+
+-- 12. Yahoo 類別每日收盤快照表：累積每日類股強弱與成交金額變化
+CREATE TABLE IF NOT EXISTS yahoo_category_daily_snapshots (
+    trade_date       TEXT    NOT NULL,
+    category_key     TEXT    NOT NULL,
+    stock_count      INTEGER NOT NULL DEFAULT 0,
+    avg_change_pct   REAL,
+    up_count         INTEGER NOT NULL DEFAULT 0,
+    down_count       INTEGER NOT NULL DEFAULT 0,
+    total_turnover_m REAL,
+    updated_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (trade_date, category_key),
+    FOREIGN KEY (category_key) REFERENCES yahoo_categories (category_key) ON DELETE CASCADE
 );

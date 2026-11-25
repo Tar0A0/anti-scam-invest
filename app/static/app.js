@@ -3,6 +3,9 @@
 const state = {
   stocks: [],
   pendingOrder: null,
+  classGroup: "",
+  selectedCategoryKey: "",
+  syncTimer: null,
 };
 
 const fmtMoney = (n) => Number(n).toLocaleString("zh-TW", { maximumFractionDigits: 2 });
@@ -396,6 +399,20 @@ function wireEvents() {
 
   document.getElementById("btn-run-reality-check").addEventListener("click", loadRealityCheck);
 
+  document.getElementById("btn-sync-classes").addEventListener("click", async () => {
+    const msgEl = document.getElementById("classes-sync-msg");
+    const res = await api("/api/classes/sync", { method: "POST" });
+    if (res.ok) {
+      msgEl.textContent = res.data.started ? "已啟動全類別背景同步，正在抓取最新成分股報價..." : "全類別同步已在執行中...";
+      startSyncPolling();
+    }
+  });
+
+  document.getElementById("class-search").addEventListener("input", () => loadClasses());
+  document.getElementById("quote-search").addEventListener("input", () => {
+    if (state.selectedCategoryKey) loadCategoryQuotes(state.selectedCategoryKey);
+  });
+
   document.getElementById("order-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fb = document.getElementById("order-feedback");
@@ -495,5 +512,161 @@ function wireEvents() {
 
 document.addEventListener("DOMContentLoaded", async () => {
   wireEvents();
-  await Promise.all([loadOverview(), loadSchedules(), loadRealityCheck()]);
+  await Promise.all([loadOverview(), loadSchedules(), loadRealityCheck(), loadClasses()]);
 });
+
+async function loadClasses() {
+  const q = document.getElementById("class-search").value.trim();
+  const params = new URLSearchParams();
+  if (state.classGroup) params.set("group", state.classGroup);
+  if (q) params.set("q", q);
+  const res = await api(`/api/classes?${params.toString()}`);
+  if (!res.ok) return;
+
+  const d = res.data;
+  const sumEl = document.getElementById("classes-summary");
+  sumEl.textContent = d.categories.length
+    ? `共 ${Object.values(d.group_counts).reduce((a, b) => a + b, 0)} 個分類 · 收錄 ${d.unique_symbols} 檔不重複台股（${d.total_quote_rows} 筆分類報價）· 最後更新：${d.last_updated_at || "--"}`
+    : "尚未同步台股全類別資料，請點擊右側「立即同步全類別」。";
+
+  const exportLink = document.getElementById("btn-export-csv");
+  const expParams = new URLSearchParams();
+  if (state.classGroup) expParams.set("group", state.classGroup);
+  else if (state.selectedCategoryKey) expParams.set("category_key", state.selectedCategoryKey);
+  exportLink.href = `/api/classes/export.csv?${expParams.toString()}`;
+
+  // 分組篩選鈕
+  const groups = ["", "上市", "上櫃", "興櫃", "概念股", "集團股", "電子產業"];
+  const pillsEl = document.getElementById("class-group-pills");
+  pillsEl.replaceChildren(
+    ...groups.map((g) => {
+      const label = g ? `${g} (${d.group_counts[g] || 0})` : "全部";
+      return el("button", {
+        type: "button",
+        class: `pill-btn ${state.classGroup === g ? "active" : ""}`,
+        text: label,
+        onclick: () => {
+          state.classGroup = g;
+          state.selectedCategoryKey = "";
+          loadClasses();
+        },
+      });
+    }),
+  );
+
+  // 分類清單
+  const listEl = document.getElementById("class-list");
+  if (!d.categories.length) {
+    listEl.replaceChildren(el("p", { class: "muted", text: "目前無符合條件的分類。" }));
+    document.getElementById("class-quotes-body").replaceChildren();
+    return;
+  }
+
+  if (!state.selectedCategoryKey || !d.categories.some((c) => c.category_key === state.selectedCategoryKey)) {
+    state.selectedCategoryKey = d.categories[0].category_key;
+  }
+
+  listEl.replaceChildren(
+    ...d.categories.map((c) => {
+      const avgText = c.avg_change_pct !== null ? `${c.avg_change_pct >= 0 ? "+" : ""}${c.avg_change_pct}%` : "--";
+      return el("button", {
+        type: "button",
+        class: `class-item ${c.category_key === state.selectedCategoryKey ? "active" : ""}`,
+        onclick: () => {
+          state.selectedCategoryKey = c.category_key;
+          loadClasses();
+        },
+      }, [
+        el("div", {}, [
+          el("div", { class: "class-item-name", text: c.name }),
+          el("div", { class: "class-item-meta", text: `${c.group_type} · ${c.stock_count} 檔 (漲${c.up_count}/跌${c.down_count})` }),
+        ]),
+        el("span", {
+          class: (c.avg_change_pct || 0) >= 0 ? "pos" : "neg",
+          style: "font-weight: 700; font-size: 0.85rem;",
+          text: avgText,
+        }),
+      ]);
+    }),
+  );
+
+  if (d.sync_status?.running) startSyncPolling();
+  await loadCategoryQuotes(state.selectedCategoryKey);
+}
+
+async function loadCategoryQuotes(categoryKey) {
+  const q = document.getElementById("quote-search").value.trim();
+  const params = q ? `?q=${encodeURIComponent(q)}` : "";
+  const res = await api(`/api/classes/${encodeURIComponent(categoryKey)}/quotes${params}`);
+  if (!res.ok) return;
+
+  const { category, quotes } = res.data;
+  document.getElementById("selected-class-title").textContent = `${category.group_type} · ${category.name}（${quotes.length} 檔）`;
+
+  const body = document.getElementById("class-quotes-body");
+  if (!quotes.length) {
+    body.replaceChildren(el("tr", {}, [el("td", { colspan: "6", class: "muted", text: "尚無成分股報價資料。" })]));
+    return;
+  }
+
+  body.replaceChildren(
+    ...quotes.map((item) => {
+      const chgCls = (item.change_pct || 0) > 0 ? "pos" : ((item.change_pct || 0) < 0 ? "neg" : "");
+      const chgText = item.change_pct !== null
+        ? `${item.change >= 0 ? "+" : ""}${item.change} (${item.change_pct >= 0 ? "+" : ""}${item.change_pct}%)`
+        : "--";
+      const lots = Math.round((item.volume || 0) / 1000);
+      const limitTag = item.limit_up ? " [漲停]" : (item.limit_down ? " [跌停]" : "");
+
+      return el("tr", {}, [
+        el("td", {}, [
+          el("strong", { text: item.symbol_name }),
+          el("div", { class: "stock-code", text: `${item.symbol}${limitTag}` }),
+        ]),
+        el("td", { class: chgCls, style: "font-weight: 700;", text: item.price !== null ? `${fmtMoney(item.price)}` : "--" }),
+        el("td", { class: chgCls, text: chgText }),
+        el("td", { text: `${item.open ?? "--"} / ${item.high ?? "--"} / ${item.low ?? "--"} / ${item.prev_close ?? "--"}` }),
+        el("td", { text: `${fmtMoney(lots)} 張 / ${item.turnover_m ?? "--"} M` }),
+        el("td", {}, [
+          item.price ? el("button", {
+            type: "button",
+            class: "btn btn-outline btn-sm",
+            text: "帶入下單",
+            onclick: () => {
+              const sel = document.getElementById("order-symbol");
+              if (![...sel.options].some((o) => o.value === item.symbol)) {
+                sel.appendChild(el("option", { value: item.symbol, text: `${item.symbol_name} (${item.symbol}) · ${item.price} 元` }));
+              }
+              sel.value = item.symbol;
+              document.getElementById("order-side").value = "BUY";
+              document.getElementById("order-price").value = item.price;
+              document.getElementById("order-sl").value = (item.price * 0.95).toFixed(2);
+              document.getElementById("order-tp").value = (item.price * 1.1).toFixed(2);
+              switchTab("tab-trade");
+            },
+          }) : el("span", { class: "muted", text: "--" }),
+        ]),
+      ]);
+    }),
+  );
+}
+
+function startSyncPolling() {
+  if (state.syncTimer) return;
+  state.syncTimer = setInterval(async () => {
+    const res = await api("/api/classes/sync-status");
+    if (!res.ok) return;
+    const s = res.data;
+    const msgEl = document.getElementById("classes-sync-msg");
+    if (s.running) {
+      msgEl.textContent = `同步進行中：${s.synced_categories} / ${s.total_categories || "?"} 類別（已寫入 ${s.total_quote_rows} 筆報價）...`;
+    } else {
+      clearInterval(state.syncTimer);
+      state.syncTimer = null;
+      msgEl.textContent = s.last_error
+        ? `同步完成（部分異常）：${s.synced_categories} 類別、${s.total_quote_rows} 筆，錯誤：${s.last_error}`
+        : `同步完成：共 ${s.synced_categories} 類別、${s.total_quote_rows} 筆報價（${s.last_finished_at || ""}）`;
+      await Promise.all([loadClasses(), loadSchedules()]);
+    }
+  }, 1500);
+}
