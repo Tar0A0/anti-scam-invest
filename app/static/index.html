@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>安心股伴 StockMate · 股市小白分析與模擬交易</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div class="brand">
+        <span class="brand-badge">SM</span>
+        <div>
+          <h1>安心股伴 StockMate</h1>
+          <p class="subtitle">白話選股建議 · 模擬演練 · 防上頭保護</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <select id="source-select" class="source-select" aria-label="行情資料源">
+          <option value="yahoo">真實市場 (Yahoo Finance)</option>
+          <option value="mock">模擬市場 (Mock)</option>
+        </select>
+        <button id="btn-refresh-market" class="btn btn-primary" type="button">更新行情</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- 資料源降級或異常提示橫幅 -->
+    <section id="source-notice-banner" class="notice-banner hidden" role="status"></section>
+    <!-- 冷靜鎖定警示橫幅（觸發防上頭機制時自動顯示） -->
+    <section id="lockout-banner" class="alert-banner hidden" role="alert"></section>
+
+    <!-- 帳戶總覽 KPI 列 -->
+    <section class="kpi-grid" aria-label="帳戶總覽">
+      <article class="kpi-card">
+        <span class="kpi-label">模擬總資產</span>
+        <strong id="kpi-equity" class="kpi-value">--</strong>
+        <span id="kpi-return" class="kpi-sub">--</span>
+      </article>
+      <article class="kpi-card">
+        <span class="kpi-label">可用模擬現金</span>
+        <strong id="kpi-cash" class="kpi-value">--</strong>
+        <span class="kpi-sub">單標上限 20% 分散保護</span>
+      </article>
+      <article class="kpi-card">
+        <span class="kpi-label">今日已實現損益</span>
+        <strong id="kpi-pnl" class="kpi-value">--</strong>
+        <span class="kpi-sub">單日虧損達 -5% 自動冷靜</span>
+      </article>
+      <article class="kpi-card">
+        <span class="kpi-label">市場平均健康度</span>
+        <strong id="kpi-health" class="kpi-value">--</strong>
+        <span id="kpi-health-note" class="kpi-sub">--</span>
+      </article>
+    </section>
+
+    <!-- 頁籤導覽 -->
+    <nav class="tabs" role="tablist" aria-label="功能分頁">
+      <button class="tab-btn active" data-tab="tab-market" type="button">市場與白話建議</button>
+      <button class="tab-btn" data-tab="tab-trade" type="button">模擬下單與持倉</button>
+      <button class="tab-btn" data-tab="tab-forecast" type="button">條件情境模擬</button>
+      <button class="tab-btn" data-tab="tab-scheduler" type="button">排程與執行日誌</button>
+    </nav>
+
+    <!-- 分頁 1：市場與白話建議 -->
+    <section id="tab-market" class="tab-panel active">
+      <article class="report-card">
+        <div class="report-head">
+          <div>
+            <span class="eyebrow">每日盤後白話日報</span>
+            <h2 id="report-headline">載入中...</h2>
+          </div>
+          <span id="report-date" class="muted-tag">--</span>
+        </div>
+        <p id="report-summary" class="report-summary"></p>
+        <div id="report-counts" class="action-chips"></div>
+      </article>
+
+      <div id="stock-grid" class="stock-grid"></div>
+    </section>
+
+    <!-- 分頁 2：模擬下單與持倉 -->
+    <section id="tab-trade" class="tab-panel">
+      <div class="two-col">
+        <article class="panel-card">
+          <h2>防呆模擬下單</h2>
+          <p class="panel-desc">每筆下單前皆會顯示「最大可能虧損」並檢查 20% 單標上限與頻繁交易防上頭規則。</p>
+          <form id="order-form" class="form-stack">
+            <label>
+              標的代碼
+              <select id="order-symbol" required></select>
+            </label>
+            <div class="form-row">
+              <label>
+                買賣方向
+                <select id="order-side">
+                  <option value="BUY">買進 (BUY)</option>
+                  <option value="SELL">賣出 (SELL)</option>
+                </select>
+              </label>
+              <label>
+                股數
+                <input id="order-qty" type="number" min="1" step="1" value="100" required />
+              </label>
+            </div>
+            <div class="form-row">
+              <label>
+                委託價格 (元)
+                <input id="order-price" type="number" min="0.1" step="0.01" required />
+              </label>
+              <label>
+                自動停損價 (選填，保護本金)
+                <input id="order-sl" type="number" min="0.1" step="0.01" placeholder="例如買價 -5%" />
+              </label>
+            </div>
+            <label>
+              自動停利價 (選填，落袋為安)
+              <input id="order-tp" type="number" min="0.1" step="0.01" placeholder="例如買價 +10%" />
+            </label>
+            <button class="btn btn-primary" type="submit">檢查風控並預覽下單</button>
+          </form>
+          <p id="order-feedback" class="feedback-msg"></p>
+        </article>
+
+        <article class="panel-card">
+          <div class="panel-head-inline">
+            <h2>目前模擬持倉</h2>
+            <button id="btn-check-triggers" class="btn btn-outline" type="button">掃描停損 / 停利</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>標的</th>
+                  <th>股數</th>
+                  <th>均價 / 現價</th>
+                  <th>損益</th>
+                  <th>停損 / 停利</th>
+                </tr>
+              </thead>
+              <tbody id="positions-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </div>
+
+      <article class="panel-card">
+        <h2>最近模擬交易紀錄</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>時間 (UTC)</th>
+                <th>標的</th>
+                <th>動作</th>
+                <th>股數 × 價格</th>
+                <th>估算最大虧損</th>
+                <th>狀態 / 說明</th>
+              </tr>
+            </thead>
+            <tbody id="orders-body"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <!-- 分頁 3：條件情境模擬 -->
+    <section id="tab-forecast" class="tab-panel">
+      <div class="two-col">
+        <article class="panel-card">
+          <h2>條件式預測模擬</h2>
+          <p class="panel-desc">手動調整大盤波動、成交量與消息面假設，即時估算未來 5 日可能區間與風險。</p>
+          <form id="forecast-form" class="form-stack">
+            <label>
+              選擇模擬標的
+              <select id="forecast-symbol" required></select>
+            </label>
+            <label>
+              假設大盤漲跌幅：<strong id="val-mkt">0.0%</strong>
+              <input id="forecast-mkt" type="range" min="-10" max="10" step="0.5" value="0" />
+            </label>
+            <label>
+              假設成交量倍數：<strong id="val-vol">1.0 倍</strong>
+              <input id="forecast-vol" type="range" min="0.5" max="3.0" step="0.1" value="1.0" />
+            </label>
+            <label>
+              假設消息面情境
+              <select id="forecast-news">
+                <option value="neutral">平穩無重大事件</option>
+                <option value="positive">財報 / 產業利多</option>
+                <option value="negative">總經 / 財報利空</option>
+              </select>
+            </label>
+            <button class="btn btn-primary" type="submit">試算未來 5 日區間</button>
+          </form>
+        </article>
+
+        <article class="panel-card">
+          <h2>預估走勢與風險區間</h2>
+          <div id="forecast-result" class="forecast-box">
+            <p class="muted">請在左側設定假設條件並點擊「試算未來 5 日區間」。</p>
+          </div>
+        </article>
+      </div>
+
+      <article class="panel-card">
+        <div class="panel-head-inline">
+          <div>
+            <h2>真實走勢回測驗證（Reality Check）</h2>
+            <p class="panel-desc">以過去歷史走勢滾動檢驗本系統「四選一建議」在未來 5 個交易日的方向命中率，作為微調策略依據。</p>
+          </div>
+          <button id="btn-run-reality-check" class="btn btn-outline" type="button">重新統計回測</button>
+        </div>
+        <div id="reality-summary" class="reality-summary"></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>標的</th>
+                <th>方向訊號數</th>
+                <th>5 日方向命中率</th>
+                <th>平均訊號報酬</th>
+              </tr>
+            </thead>
+            <tbody id="reality-body"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <!-- 分頁 4：排程與執行日誌 -->
+    <section id="tab-scheduler" class="tab-panel">
+      <article class="panel-card">
+        <h2>定時排程設定（支援一鍵手動重跑）</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>任務名稱</th>
+                <th>說明</th>
+                <th>Cron 排程 (分 時 日 月 週)</th>
+                <th>啟用</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="schedules-body"></tbody>
+          </table>
+        </div>
+        <p id="schedule-feedback" class="feedback-msg"></p>
+      </article>
+
+      <article class="panel-card">
+        <h2>執行狀態日誌（最近 30 筆）</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>觸發時間 (UTC)</th>
+                <th>任務</th>
+                <th>觸發方式</th>
+                <th>狀態</th>
+                <th>耗時 / 重試</th>
+                <th>處理筆數 / 錯誤訊息</th>
+              </tr>
+            </thead>
+            <tbody id="logs-body"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+  </main>
+
+  <!-- 防呆二次確認視窗 -->
+  <div id="confirm-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-card">
+      <h3 id="modal-title">下單防呆二次確認</h3>
+      <p id="modal-summary" class="modal-summary"></p>
+      <div class="loss-highlight">
+        <span>本次估算最大可能虧損</span>
+        <strong id="modal-max-loss">--</strong>
+      </div>
+      <ul id="modal-reasons" class="modal-reasons"></ul>
+      <div class="modal-actions">
+        <button id="modal-cancel" class="btn btn-outline" type="button">再想一下（取消）</button>
+        <button id="modal-confirm" class="btn btn-primary" type="button">我已了解風險，確認送出</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

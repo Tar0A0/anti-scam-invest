@@ -1,0 +1,6 @@
+# MVP 網站可直接使用 Python 3.12 標準函式庫啟動（python -m app.web），無須額外安裝套件。
+# 以下為未來擴充至高併發正式環境或背景排程時之選配套件：
+fastapi>=0.115.0          # 進階 REST API 與自動 OpenAPI 文件
+uvicorn[standard]>=0.32.0 # ASGI 伺服器
+apscheduler>=3.10.4       # 背景定時排程引擎
+pydantic>=2.10.0          # 嚴格 Schema 驗證
