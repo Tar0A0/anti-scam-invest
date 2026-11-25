@@ -177,6 +177,10 @@ class YahooClassTest(unittest.TestCase):
                 d2 = json.loads(r2.read().decode("utf-8"))
                 self.assertEqual(d2["quotes"][0]["symbol"], "1101.TW")
 
+            with urlopen(Request(f"{base_url}/api/classes/sector%3ATAI%3A1/quotes?refresh=1"), timeout=5) as r2r:
+                d2r = json.loads(r2r.read().decode("utf-8"))
+                self.assertEqual(d2r["quotes"][0]["symbol"], "1101.TW")
+
             with urlopen(Request(f"{base_url}/api/classes/export.csv?category_key=sector%3ATAI%3A1"), timeout=5) as r3:
                 csv_text = r3.read().decode("utf-8-sig")
                 self.assertIn("1101.TW", csv_text)

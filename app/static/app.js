@@ -7,6 +7,7 @@ const state = {
   classGroup: "",
   selectedCategoryKey: "",
   syncTimer: null,
+  lastDataVersion: null,
 };
 
 const fmtMoney = (n) => Number(n).toLocaleString("zh-TW", { maximumFractionDigits: 2 });
@@ -555,6 +556,17 @@ function wireEvents() {
     await Promise.all([loadOverview(), loadSchedules(), loadRealityCheck()]);
   });
 
+  document.getElementById("live-interval-select").addEventListener("change", async (e) => {
+    const val = Number(e.target.value);
+    const body = val === 0 ? { enabled: false } : { enabled: true, interval_sec: val };
+    const res = await api("/api/live", { method: "POST", body: JSON.stringify(body) });
+    if (res.ok) updateLiveBadge(res.data);
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) pollLiveStatus();
+  });
+
   document.getElementById("btn-run-reality-check").addEventListener("click", loadRealityCheck);
 
   document.getElementById("btn-sync-classes").addEventListener("click", async () => {
@@ -740,10 +752,13 @@ async function loadClasses() {
   await loadCategoryQuotes(state.selectedCategoryKey);
 }
 
-async function loadCategoryQuotes(categoryKey) {
+async function loadCategoryQuotes(categoryKey, refresh = false) {
   const q = document.getElementById("quote-search").value.trim();
-  const params = q ? `?q=${encodeURIComponent(q)}` : "";
-  const res = await api(`/api/classes/${encodeURIComponent(categoryKey)}/quotes${params}`);
+  const qs = new URLSearchParams();
+  if (q) qs.set("q", q);
+  if (refresh) qs.set("refresh", "1");
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  const res = await api(`/api/classes/${encodeURIComponent(categoryKey)}/quotes${suffix}`);
   if (!res.ok) return;
 
   const { category, quotes } = res.data;
@@ -828,7 +843,41 @@ function startSyncPolling() {
   }, 1500);
 }
 
+function updateLiveBadge(live) {
+  const dot = document.getElementById("live-dot");
+  const sel = document.getElementById("live-interval-select");
+  dot.classList.toggle("paused", !live.enabled);
+  sel.value = live.enabled ? String(live.interval_sec) : "0";
+}
+
+async function pollLiveStatus() {
+  if (document.hidden) return;
+  const res = await api("/api/live");
+  if (!res.ok) return;
+  const live = res.data;
+  updateLiveBadge(live);
+
+  if (state.lastDataVersion === null) {
+    state.lastDataVersion = live.data_version;
+    return;
+  }
+
+  if (live.data_version > state.lastDataVersion) {
+    state.lastDataVersion = live.data_version;
+    const pill = document.getElementById("latest-quote-pill");
+    pill.classList.add("flash-updated");
+    setTimeout(() => pill.classList.remove("flash-updated"), 1200);
+
+    const tasks = [loadOverview(), loadSchedules(), loadRealityCheck()];
+    if (document.getElementById("tab-classes").classList.contains("active") && state.selectedCategoryKey) {
+      tasks.push(loadCategoryQuotes(state.selectedCategoryKey, true));
+    }
+    await Promise.all(tasks);
+  }
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   wireEvents();
-  await Promise.all([loadOverview(), loadSchedules(), loadRealityCheck(), loadClasses()]);
+  await Promise.all([loadOverview(), loadSchedules(), loadRealityCheck(), loadClasses(), pollLiveStatus()]);
+  setInterval(pollLiveStatus, 5000);
 });

@@ -165,6 +165,22 @@ class WebAppIntegrationTest(unittest.TestCase):
         self.assertGreater(rc["total_samples"], 0)
         self.assertTrue(bool(rc["calibration_hint"]))
 
+    def test_live_auto_updater_and_api(self) -> None:
+        s0, live0 = self._request("GET", "/api/live")
+        self.assertEqual(s0, 200)
+        v0 = live0["data_version"]
+
+        s_bad, _ = self._request("POST", "/api/live", {"interval_sec": 3})
+        self.assertEqual(s_bad, 400)
+
+        s_cfg, live_cfg = self._request("POST", "/api/live", {"enabled": True, "interval_sec": 30})
+        self.assertEqual(s_cfg, 200)
+        self.assertEqual(live_cfg["interval_sec"], 30)
+
+        tick_res = self.server.app_service.run_live_tick()  # type: ignore[attr-defined]
+        self.assertGreater(tick_res["data_version"], v0)
+        self.assertEqual(tick_res["tick_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

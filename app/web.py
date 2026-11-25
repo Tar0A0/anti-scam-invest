@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from app.adapters.mock import DEFAULT_WATCHLIST, MockMarketAdapter
 from app.adapters.yahoo import YahooFinanceAdapter
-from app.adapters.yahoo_class import YahooClassScraper
+from app.adapters.yahoo_class import TAIPEI_TZ, CategoryDef, YahooClassScraper
 from app.core.broker import check_stop_triggers, execute_order, get_latest_prices, get_portfolio, preview_order
 from app.core.reality_check import evaluate_strategy_accuracy
 from app.core.risk_guard import OrderRequest
@@ -66,6 +66,20 @@ class AppService:
         self.scheduler = TaskScheduler(self.db_path)
         self._lock = threading.Lock()
         self._sync_lock = threading.Lock()
+        self._live_lock = threading.Lock()
+        self._live_wake = threading.Event()
+        self._live_stop = threading.Event()
+        self._live_thread: threading.Thread | None = None
+        self._live_state: dict[str, Any] = {
+            "enabled": True,
+            "interval_sec": 60,
+            "data_version": 1,
+            "tick_count": 0,
+            "last_tick_at": None,
+            "next_tick_at": None,
+            "last_status": "READY",
+            "last_error": None,
+        }
         self._sync_state: dict[str, Any] = {
             "running": False,
             "synced_categories": 0,
@@ -178,7 +192,111 @@ class AppService:
             finally:
                 conn.close()
 
+        self.bump_data_version()
         return self.get_overview()
+
+    def bump_data_version(self) -> int:
+        """遞增全域資料版本號，通知前端自動無痛刷新最新動態。"""
+        with self._live_lock:
+            self._live_state["data_version"] += 1
+            return int(self._live_state["data_version"])
+
+    def get_live_state(self) -> dict[str, Any]:
+        with self._live_lock:
+            state = dict(self._live_state)
+        state["sync_status"] = self.get_class_sync_status()
+        return state
+
+    def update_live_config(
+        self,
+        *,
+        enabled: bool | None = None,
+        interval_sec: int | None = None,
+    ) -> dict[str, Any]:
+        """動態調整自動即時更新的開關與更新間隔（15~3600 秒）。"""
+        if interval_sec is not None and not (15 <= interval_sec <= 3600):
+            raise ValueError("更新間隔必須介於 15 到 3600 秒之間")
+
+        with self._live_lock:
+            if enabled is not None:
+                self._live_state["enabled"] = bool(enabled)
+            if interval_sec is not None:
+                self._live_state["interval_sec"] = int(interval_sec)
+
+            if self._live_state["enabled"]:
+                nxt = datetime.now(timezone.utc) + timedelta(seconds=int(self._live_state["interval_sec"]))
+                self._live_state["next_tick_at"] = nxt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            else:
+                self._live_state["next_tick_at"] = None
+
+        self._live_wake.set()
+        return self.get_live_state()
+
+    def run_live_tick(self) -> dict[str, Any]:
+        """執行單次背景即時更新（抓價、重算白話策略與停損停利掃描）。"""
+        try:
+            status, _, err_msg = self.job_fetch_market()
+            now_utc = datetime.now(timezone.utc)
+            with self._live_lock:
+                self._live_state["tick_count"] += 1
+                self._live_state["last_tick_at"] = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                self._live_state["last_status"] = status
+                self._live_state["last_error"] = err_msg
+                if self._live_state["enabled"]:
+                    nxt = now_utc + timedelta(seconds=int(self._live_state["interval_sec"]))
+                    self._live_state["next_tick_at"] = nxt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception as exc:  # noqa: BLE001
+            now_utc = datetime.now(timezone.utc)
+            with self._live_lock:
+                self._live_state["tick_count"] += 1
+                self._live_state["last_tick_at"] = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                self._live_state["last_status"] = "FAILED"
+                self._live_state["last_error"] = f"{type(exc).__name__}: {exc}"
+        return self.get_live_state()
+
+    def start_live_updater(self) -> None:
+        """啟動背景即時更新執行緒，依設定間隔自動更新動態。"""
+        # shortcut: 單機背景輪詢執行緒搭配前端輕量版本檢查達成自動更新；未來若擴展多實例再改為 Redis Pub/Sub + WebSocket/SSE
+        if self._live_thread is not None and self._live_thread.is_alive():
+            return
+
+        self._live_stop.clear()
+        self._live_wake.clear()
+        with self._live_lock:
+            if self._live_state["enabled"]:
+                nxt = datetime.now(timezone.utc) + timedelta(seconds=int(self._live_state["interval_sec"]))
+                self._live_state["next_tick_at"] = nxt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def _worker() -> None:
+            while not self._live_stop.is_set():
+                with self._live_lock:
+                    enabled = bool(self._live_state["enabled"])
+                    interval = int(self._live_state["interval_sec"])
+
+                if not enabled:
+                    self._live_wake.wait(timeout=10.0)
+                    self._live_wake.clear()
+                    continue
+
+                woken = self._live_wake.wait(timeout=float(interval))
+                self._live_wake.clear()
+                if self._live_stop.is_set():
+                    break
+                if woken:
+                    # 使用者剛切換間隔或啟用狀態，依新間隔重新計時
+                    continue
+                self.run_live_tick()
+
+        self._live_thread = threading.Thread(target=_worker, daemon=True)
+        self._live_thread.start()
+
+    def stop_live_updater(self) -> None:
+        """安全停止背景即時更新執行緒。"""
+        self._live_stop.set()
+        self._live_wake.set()
+        if self._live_thread is not None:
+            self._live_thread.join(timeout=2)
+            self._live_thread = None
 
     def job_fetch_market(self) -> tuple[str, int, str | None]:
         """依目前啟用的資料源抓取行情 -> 驗證 -> 入庫 -> 重算策略並檢查停損停利。"""
@@ -195,6 +313,7 @@ class AppService:
                     check_stop_triggers(conn, source="yahoo", now=now_utc)
                     err_msg = "；".join(issues) if issues else None
                     status = "SUCCESS" if not issues else ("PARTIAL" if cnt > 0 else "FAILED")
+                    self.bump_data_version()
                     return (status, saved, err_msg)
 
                 last_closes = get_latest_prices(conn, source="mock")
@@ -218,6 +337,7 @@ class AppService:
                 check_stop_triggers(conn, source="mock", now=now_utc)
 
                 err_msg = "；".join(f"{i.symbol}: {i.reason}" for i in validation.issues) if validation.issues else None
+                self.bump_data_version()
                 return (validation.status, saved, err_msg)
             finally:
                 conn.close()
@@ -261,6 +381,7 @@ class AppService:
                     }
                 )
             status = "SUCCESS" if summary["failed_categories"] == 0 else ("PARTIAL" if summary["synced_categories"] > 0 else "FAILED")
+            self.bump_data_version()
             return (status, int(summary["total_quote_rows"]), err_msg)
         except Exception as exc:
             with self._sync_lock:
@@ -329,8 +450,8 @@ class AppService:
             finally:
                 conn.close()
 
-    def get_category_quotes(self, category_key: str, *, q: str = "") -> dict[str, Any]:
-        """查詢指定類別的成分股即時報價。"""
+    def get_category_quotes(self, category_key: str, *, q: str = "", refresh: bool = False) -> dict[str, Any]:
+        """查詢指定類別的成分股即時報價；refresh=True 時即時重抓該類別最新動態。"""
         with self._lock:
             conn = get_connection(self.db_path)
             try:
@@ -340,7 +461,90 @@ class AppService:
                 ).fetchone()
                 if cat is None:
                     raise KeyError(f"找不到類別：{category_key}")
+                cat_dict = dict(cat)
+            finally:
+                conn.close()
 
+        if refresh:
+            cat_def = CategoryDef(
+                category_key=cat_dict["category_key"],
+                group_type=cat_dict["group_type"],
+                name=cat_dict["name"],
+                sector_id=cat_dict["sector_id"],
+                exchange=cat_dict["exchange"],
+                category_param=cat_dict["category_param"],
+                category_label=cat_dict["category_label"],
+            )
+            try:
+                fresh_quotes = self.class_scraper.fetch_category_quotes(cat_def)
+                now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                trade_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+                changes = [item["change_pct"] for item in fresh_quotes if item["change_pct"] is not None]
+                avg_chg = round(sum(changes) / len(changes), 2) if changes else None
+                up_cnt = sum(1 for item in fresh_quotes if (item["change_pct"] or 0) > 0)
+                down_cnt = sum(1 for item in fresh_quotes if (item["change_pct"] or 0) < 0)
+                turnovers = [item["turnover_m"] for item in fresh_quotes if item["turnover_m"] is not None]
+                total_turnover = round(sum(turnovers), 2) if turnovers else None
+
+                with self._lock:
+                    u_conn = get_connection(self.db_path)
+                    try:
+                        with u_conn:
+                            u_conn.execute("DELETE FROM yahoo_category_quotes WHERE category_key = ?;", (category_key,))
+                            u_conn.executemany(
+                                """
+                                INSERT INTO yahoo_category_quotes
+                                    (category_key, symbol, symbol_name, exchange, price, change, change_pct,
+                                     change_status, open, high, low, prev_close, volume, turnover_m,
+                                     limit_up, limit_down, market_status, quote_time, updated_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                                """,
+                                [
+                                    (
+                                        category_key, item["symbol"], item["symbol_name"], item["exchange"],
+                                        item["price"], item["change"], item["change_pct"], item["change_status"],
+                                        item["open"], item["high"], item["low"], item["prev_close"], item["volume"],
+                                        item["turnover_m"], item["limit_up"], item["limit_down"], item["market_status"],
+                                        item["quote_time"], now_iso,
+                                    )
+                                    for item in fresh_quotes
+                                ],
+                            )
+                            u_conn.execute(
+                                """
+                                UPDATE yahoo_categories
+                                SET stock_count = ?, avg_change_pct = ?, up_count = ?, down_count = ?, updated_at = ?
+                                WHERE category_key = ?;
+                                """,
+                                (len(fresh_quotes), avg_chg, up_cnt, down_cnt, now_iso, category_key),
+                            )
+                            u_conn.execute(
+                                """
+                                INSERT INTO yahoo_category_daily_snapshots
+                                    (trade_date, category_key, stock_count, avg_change_pct, up_count, down_count, total_turnover_m, updated_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(trade_date, category_key) DO UPDATE SET
+                                    stock_count = excluded.stock_count,
+                                    avg_change_pct = excluded.avg_change_pct,
+                                    up_count = excluded.up_count,
+                                    down_count = excluded.down_count,
+                                    total_turnover_m = excluded.total_turnover_m,
+                                    updated_at = excluded.updated_at;
+                                """,
+                                (trade_date, category_key, len(fresh_quotes), avg_chg, up_cnt, down_cnt, total_turnover, now_iso),
+                            )
+                    finally:
+                        u_conn.close()
+            except Exception:  # noqa: BLE001 - 單類即時刷新若暫時斷線，仍安全回傳資料庫快取
+                pass
+
+        with self._lock:
+            conn = get_connection(self.db_path)
+            try:
+                cat = conn.execute(
+                    "SELECT * FROM yahoo_categories WHERE category_key = ?;",
+                    (category_key,),
+                ).fetchone()
                 params: list[Any] = [category_key]
                 filter_sql = ""
                 if q:
@@ -549,6 +753,7 @@ def create_server(
     yahoo_adapter: YahooFinanceAdapter | None = None,
     class_scraper: YahooClassScraper | None = None,
     start_scheduler: bool = False,
+    start_live: bool = False,
 ) -> ThreadingHTTPServer:
     """建立可立即啟動的 MVP HTTP 伺服器。"""
     # shortcut: 使用 Python 內建 ThreadingHTTPServer 零依賴啟動 MVP 網站；未來若需高併發、JWT 或 OpenAPI 文件再升級為 FastAPI
@@ -561,6 +766,8 @@ def create_server(
     )
     if start_scheduler:
         service.scheduler.start_builtin_loop()
+    if start_live:
+        service.start_live_updater()
     static_root = STATIC_DIR.resolve()
 
     class AppHandler(BaseHTTPRequestHandler):
@@ -608,6 +815,9 @@ def create_server(
             if path == "/api/overview":
                 self._send_json(HTTPStatus.OK, service.get_overview())
                 return
+            if path == "/api/live":
+                self._send_json(HTTPStatus.OK, service.get_live_state())
+                return
             if path == "/api/reality-check":
                 self._send_json(HTTPStatus.OK, service.get_reality_check())
                 return
@@ -636,8 +846,9 @@ def create_server(
             if path.startswith("/api/classes/") and path.endswith("/quotes"):
                 cat_key = unquote(path[len("/api/classes/"):-len("/quotes")]).strip("/")
                 q = (query.get("q") or [""])[0].strip()
+                refresh = (query.get("refresh") or ["0"])[0].strip().lower() in ("1", "true")
                 try:
-                    self._send_json(HTTPStatus.OK, service.get_category_quotes(cat_key, q=q))
+                    self._send_json(HTTPStatus.OK, service.get_category_quotes(cat_key, q=q, refresh=refresh))
                 except KeyError as exc:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
                 return
@@ -668,6 +879,16 @@ def create_server(
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
+
+            if path == "/api/live":
+                try:
+                    body = self._read_json()
+                    enabled = bool(body["enabled"]) if "enabled" in body else None
+                    interval = int(body["interval_sec"]) if "interval_sec" in body else None
+                    self._send_json(HTTPStatus.OK, service.update_live_config(enabled=enabled, interval_sec=interval))
+                except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
 
             if path == "/api/classes/sync":
                 started, state = service.start_async_class_sync()
@@ -720,6 +941,8 @@ def create_server(
                         finally:
                             conn.close()
                     status = HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST
+                    if ok:
+                        service.bump_data_version()
                     self._send_json(status, {"ok": ok, "check": asdict(check), "order": order_info})
                 except (ValueError, json.JSONDecodeError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -732,6 +955,8 @@ def create_server(
                         triggered = check_stop_triggers(conn, source=service.active_source)
                     finally:
                         conn.close()
+                if triggered:
+                    service.bump_data_version()
                 self._send_json(HTTPStatus.OK, {"triggered": triggered})
                 return
 
@@ -761,13 +986,14 @@ def create_server(
 
 def main() -> None:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
-    server = create_server(port=port, default_source="yahoo", start_scheduler=True)
-    print(f"安心股伴 StockMate 網站已啟動：http://127.0.0.1:{port}（已啟用每日 Cron 自動排程）", flush=True)
+    server = create_server(port=port, default_source="yahoo", start_scheduler=True, start_live=True)
+    print(f"安心股伴 StockMate 網站已啟動：http://127.0.0.1:{port}（已啟用自動即時更新與 Cron 排程）", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        server.app_service.stop_live_updater()  # type: ignore[attr-defined]
         server.app_service.scheduler.stop_builtin_loop()  # type: ignore[attr-defined]
         server.server_close()
 

@@ -248,7 +248,7 @@ body {
   gap: 10px;
 }
 
-.source-control {
+.source-control, .live-control {
   display: flex;
   align-items: center;
   gap: 7px;
@@ -257,6 +257,26 @@ body {
   border-radius: 6px;
   padding: 0 10px;
   height: 32px;
+}
+
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--down);
+  animation: livePulse 2.4s ease-in-out infinite;
+}
+.live-dot.paused { background: var(--muted); animation: none; }
+
+@keyframes livePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.mono-pill.flash-updated {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-tint);
 }
 
 .status-dot {

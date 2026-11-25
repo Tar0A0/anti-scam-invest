@@ -66,6 +66,15 @@
           <span id="latest-quote-pill" class="mono-pill">--</span>
         </div>
         <div class="topbar-right">
+          <div class="live-control" title="自動更新市場動態">
+            <span id="live-dot" class="live-dot" aria-hidden="true"></span>
+            <select id="live-interval-select" class="source-select" aria-label="自動更新頻率">
+              <option value="30">自動 30 秒</option>
+              <option value="60" selected>自動 60 秒</option>
+              <option value="300">自動 5 分</option>
+              <option value="0">暫停自動</option>
+            </select>
+          </div>
           <div class="source-control">
             <span id="source-dot" class="status-dot" aria-hidden="true"></span>
             <select id="source-select" class="source-select" aria-label="行情資料源">
