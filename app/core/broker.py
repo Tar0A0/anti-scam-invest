@@ -46,7 +46,19 @@ def get_latest_prices(conn: sqlite3.Connection, *, source: str | None = None) ->
             ON q.symbol = latest.symbol AND q.quote_time = latest.max_time;
             """
         ).fetchall()
-    return {r["symbol"]: float(r["close"]) for r in rows}
+    prices = {r["symbol"]: float(r["close"]) for r in rows}
+    # 補齊來自台股全類別下單、尚未寫入 market_quotes 的持倉現價
+    cat_rows = conn.execute(
+        """
+        SELECT symbol, price
+        FROM yahoo_category_quotes
+        WHERE price IS NOT NULL
+        ORDER BY updated_at ASC;
+        """
+    ).fetchall()
+    for r in cat_rows:
+        prices.setdefault(r["symbol"], float(r["price"]))
+    return prices
 
 
 def get_portfolio(
@@ -75,10 +87,17 @@ def get_portfolio(
         unrealized_pnl = round((current_price - avg_cost) * qty, 2)
         unrealized_pct = round(((current_price - avg_cost) / avg_cost * 100.0) if avg_cost > 0 else 0.0, 2)
         positions_value += market_value
+        display_name = names.get(symbol)
+        if not display_name:
+            name_row = conn.execute(
+                "SELECT symbol_name FROM yahoo_category_quotes WHERE symbol = ? LIMIT 1;",
+                (symbol,),
+            ).fetchone()
+            display_name = str(name_row["symbol_name"]) if name_row else symbol
         positions.append(
             {
                 "symbol": symbol,
-                "name": names.get(symbol, symbol),
+                "name": display_name,
                 "quantity": qty,
                 "avg_cost": round(avg_cost, 2),
                 "current_price": round(current_price, 2),

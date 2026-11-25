@@ -357,6 +357,16 @@ body {
   margin-bottom: 12px;
 }
 
+.panel-head-wrap {
+  flex-wrap: wrap;
+}
+
+.watchlist-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .editorial-brief {
   background: var(--surface);
   border: 1px solid var(--border);

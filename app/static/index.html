@@ -133,10 +133,18 @@
 
           <div class="overview-split">
             <section class="panel" aria-label="追蹤標的列表">
-              <div class="panel-head">
-                <h2>核心追蹤標的</h2>
-                <span class="muted-text">點選任一列檢視白話診斷</span>
+              <div class="panel-head panel-head-wrap">
+                <div>
+                  <h2>核心追蹤標的</h2>
+                  <span class="muted-text">點選任一列檢視白話診斷，可自由增減喜好的股票</span>
+                </div>
+                <form id="watchlist-add-form" class="watchlist-form">
+                  <input id="watchlist-input" class="input-compact" list="watchlist-suggestions" type="text" placeholder="新增代號或股名（如 2303 / 聯電）" autocomplete="off" />
+                  <datalist id="watchlist-suggestions"></datalist>
+                  <button class="btn btn-primary btn-sm" type="submit">新增</button>
+                </form>
               </div>
+              <p id="watchlist-feedback" class="feedback-msg" style="margin: 0 0 8px;"></p>
               <div class="table-wrap">
                 <table class="data-table">
                   <thead>
@@ -146,6 +154,7 @@
                       <th class="num">現價 / 漲跌</th>
                       <th class="num">健康度</th>
                       <th>操作建議</th>
+                      <th></th>
                     </tr>
                   </thead>
                   <tbody id="watchlist-body"></tbody>
@@ -218,8 +227,28 @@
               <h2>防呆委託下單單據</h2>
               <p class="muted-text" style="margin-bottom: 14px;">送單前顯示最大可能虧損，並檢查 20% 單標上限與頻繁交易冷靜鎖。</p>
               <form id="order-form" class="form-stack">
+                <div class="form-row">
+                  <label class="field">
+                    <span>類股分組</span>
+                    <select id="order-group">
+                      <option value="">全部類別</option>
+                      <option value="__watchlist__">核心自選清單</option>
+                      <option value="上市">上市類股</option>
+                      <option value="上櫃">上櫃類股</option>
+                      <option value="興櫃">興櫃類股</option>
+                      <option value="概念股">概念股</option>
+                      <option value="集團股">集團股</option>
+                      <option value="電子產業">電子產業</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>選擇類別</span>
+                    <select id="order-category"></select>
+                  </label>
+                </div>
+
                 <label class="field">
-                  <span>標的代碼</span>
+                  <span>股票代碼</span>
                   <select id="order-symbol" required></select>
                 </label>
 

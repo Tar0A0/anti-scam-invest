@@ -181,3 +181,10 @@ CREATE TABLE IF NOT EXISTS yahoo_category_daily_snapshots (
     PRIMARY KEY (trade_date, category_key),
     FOREIGN KEY (category_key) REFERENCES yahoo_categories (category_key) ON DELETE CASCADE
 );
+
+-- 13. 使用者自選核心追蹤清單（盤勢總覽動態新增／移除）
+CREATE TABLE IF NOT EXISTS watchlist (
+    symbol   TEXT PRIMARY KEY,
+    name     TEXT NOT NULL,
+    added_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);

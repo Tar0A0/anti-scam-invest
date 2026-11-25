@@ -17,6 +17,14 @@ DEFAULT_SCHEDULES = (
     ("sync_yahoo_classes", "sync_classes", "*/15 9-14 * * 1-5", 1, 2, "每日盤中與盤後同步 Yahoo 台股全類別與即時報價"),
 )
 
+DEFAULT_WATCHLIST_SEEDS = (
+    ("0050.TW", "台灣 50 ETF"),
+    ("0056.TW", "高股息 ETF"),
+    ("2330.TW", "台積電"),
+    ("2317.TW", "鴻海"),
+    ("2454.TW", "聯發科"),
+)
+
 
 def get_connection(db_path: str | Path) -> sqlite3.Connection:
     """建立啟用 WAL 模式與外鍵約束的 SQLite 連線。"""
@@ -76,5 +84,12 @@ def init_db(db_path: str | Path) -> None:
                 """,
                 DEFAULT_SCHEDULES,
             )
+            # 僅於 watchlist 全空時寫入預設 5 檔，讓使用者刪除後重啟不會自動復活
+            wl_cnt = conn.execute("SELECT COUNT(*) AS cnt FROM watchlist;").fetchone()["cnt"]
+            if wl_cnt == 0:
+                conn.executemany(
+                    "INSERT INTO watchlist (symbol, name) VALUES (?, ?);",
+                    DEFAULT_WATCHLIST_SEEDS,
+                )
     finally:
         conn.close()

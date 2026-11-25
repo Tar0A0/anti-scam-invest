@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 import sys
 import threading
 from dataclasses import asdict
@@ -123,16 +124,31 @@ class AppService:
             description="每日盤中與盤後同步 Yahoo 台股全類別與即時報價",
         )
 
+    def _get_watchlist(self, conn: Any) -> dict[str, str]:
+        """讀取使用者目前自選追蹤清單（symbol -> name）。"""
+        rows = conn.execute("SELECT symbol, name FROM watchlist ORDER BY added_at ASC, symbol ASC;").fetchall()
+        return {str(r["symbol"]): str(r["name"]) for r in rows}
+
     def _seed_mock_if_empty(self, conn: Any) -> None:
-        cnt = conn.execute("SELECT COUNT(*) AS cnt FROM market_quotes WHERE source = 'mock';").fetchone()["cnt"]
-        if cnt == 0:
-            quotes = self.mock_adapter.seed_history(list(SYMBOL_NAMES.keys()), days=30)
+        watchlist = self._get_watchlist(conn)
+        if not watchlist:
+            return
+        existing_syms = {
+            r["symbol"]
+            for r in conn.execute("SELECT DISTINCT symbol FROM market_quotes WHERE source = 'mock';").fetchall()
+        }
+        missing = [s for s in watchlist if s not in existing_syms]
+        if missing:
+            quotes = self.mock_adapter.seed_history(missing, days=30)
             result = validate_quotes(quotes)
             save_validated_quotes(conn, result)
-        run_strategy_and_save(conn, SYMBOL_NAMES, source="mock")
+        run_strategy_and_save(conn, watchlist, source="mock")
 
-    def _fetch_yahoo_batch(self, conn: Any) -> tuple[int, list[str]]:
-        quotes = self.yahoo_adapter.fetch_quotes(list(SYMBOL_NAMES.keys()))
+    def _fetch_yahoo_batch(self, conn: Any, symbols: list[str] | None = None) -> tuple[int, list[str]]:
+        target_symbols = symbols if symbols is not None else list(self._get_watchlist(conn).keys())
+        if not target_symbols:
+            return 0, []
+        quotes = self.yahoo_adapter.fetch_quotes(target_symbols)
         validation = validate_quotes(quotes, max_daily_change_pct=0.25)
         saved = save_validated_quotes(conn, validation)
         issues = [f"{sym}: {err}" for sym, err in self.yahoo_adapter.last_errors.items()]
@@ -143,17 +159,18 @@ class AppService:
         with self._lock:
             conn = get_connection(self.db_path)
             try:
+                watchlist = self._get_watchlist(conn)
                 if self.active_source == "yahoo":
                     existing = conn.execute(
                         "SELECT COUNT(*) AS cnt FROM market_quotes WHERE source = 'yahoo';"
                     ).fetchone()["cnt"]
                     if existing == 0:
-                        _, issues = self._fetch_yahoo_batch(conn)
+                        _, issues = self._fetch_yahoo_batch(conn, list(watchlist.keys()))
                         existing = conn.execute(
                             "SELECT COUNT(*) AS cnt FROM market_quotes WHERE source = 'yahoo';"
                         ).fetchone()["cnt"]
                         if existing > 0:
-                            run_strategy_and_save(conn, SYMBOL_NAMES, source="yahoo")
+                            run_strategy_and_save(conn, watchlist, source="yahoo")
                             if issues:
                                 self.last_source_notice = f"真實行情已載入，部分標的異常：{issues[0]}"
                             return
@@ -161,7 +178,7 @@ class AppService:
                         self.last_source_notice = "目前無法連線至 Yahoo Finance 真實行情，已自動切換為模擬市場模式。"
                         self._seed_mock_if_empty(conn)
                     else:
-                        run_strategy_and_save(conn, SYMBOL_NAMES, source="yahoo")
+                        run_strategy_and_save(conn, watchlist, source="yahoo")
                 else:
                     self._seed_mock_if_empty(conn)
             finally:
@@ -175,8 +192,9 @@ class AppService:
         with self._lock:
             conn = get_connection(self.db_path)
             try:
+                watchlist = self._get_watchlist(conn)
                 if new_source == "yahoo":
-                    _, issues = self._fetch_yahoo_batch(conn)
+                    _, issues = self._fetch_yahoo_batch(conn, list(watchlist.keys()))
                     cnt = conn.execute(
                         "SELECT COUNT(*) AS cnt FROM market_quotes WHERE source = 'yahoo';"
                     ).fetchone()["cnt"]
@@ -184,11 +202,144 @@ class AppService:
                         raise RuntimeError("無法取得 Yahoo Finance 真實行情，請檢查網路連線後重試")
                     self.active_source = "yahoo"
                     self.last_source_notice = f"部分標的更新異常：{issues[0]}" if issues else None
-                    run_strategy_and_save(conn, SYMBOL_NAMES, source="yahoo")
+                    run_strategy_and_save(conn, watchlist, source="yahoo")
                 else:
                     self.active_source = "mock"
                     self.last_source_notice = None
                     self._seed_mock_if_empty(conn)
+            finally:
+                conn.close()
+
+        self.bump_data_version()
+        return self.get_overview()
+
+    def search_stocks(self, q: str, limit: int = 20) -> list[dict[str, Any]]:
+        """搜尋台股代碼與名稱（優先從已同步之 Yahoo 全類別資料查詢）。"""
+        keyword = q.strip()
+        if not keyword:
+            return []
+        with self._lock:
+            conn = get_connection(self.db_path)
+            try:
+                like_kw = f"%{keyword}%"
+                rows = conn.execute(
+                    """
+                    SELECT symbol, symbol_name, MAX(exchange) AS exchange, MAX(price) AS price
+                    FROM yahoo_category_quotes
+                    WHERE symbol LIKE ? OR symbol_name LIKE ?
+                    GROUP BY symbol, symbol_name
+                    ORDER BY (symbol = ?) DESC, (symbol LIKE ?) DESC, symbol ASC
+                    LIMIT ?;
+                    """,
+                    (like_kw, like_kw, keyword.upper(), f"{keyword.upper()}%", limit),
+                ).fetchall()
+                results = [dict(r) for r in rows]
+                if not results:
+                    wl_rows = conn.execute(
+                        "SELECT symbol, name AS symbol_name FROM watchlist WHERE symbol LIKE ? OR name LIKE ? LIMIT ?;",
+                        (like_kw, like_kw, limit),
+                    ).fetchall()
+                    results = [{**dict(r), "exchange": "", "price": None} for r in wl_rows]
+                return results
+            finally:
+                conn.close()
+
+    def add_watchlist_symbol(self, raw_symbol: str, custom_name: str = "") -> dict[str, Any]:
+        """新增自選股票至盤勢總覽：自動補齊 .TW/.TWO、抓取驗證報價並寫入 watchlist。"""
+        text = raw_symbol.strip()
+        if not text:
+            raise ValueError("請輸入股票代碼或名稱")
+
+        # 支援從自動補全選擇的 "2303.TW - 聯電" 格式
+        if " - " in text:
+            text = text.split(" - ", 1)[0].strip()
+
+        with self._lock:
+            conn = get_connection(self.db_path)
+            try:
+                # 若輸入純數字（如 2303），先在類別報價找確切市場後綴（.TW / .TWO），找不到再預設 .TW
+                if text.isdigit():
+                    found = conn.execute(
+                        "SELECT symbol, symbol_name FROM yahoo_category_quotes WHERE symbol IN (?, ?) LIMIT 1;",
+                        (f"{text}.TW", f"{text}.TWO"),
+                    ).fetchone()
+                    symbol = str(found["symbol"]) if found else f"{text}.TW"
+                else:
+                    # 支援直接輸入中文股名（例如「聯電」）反查代碼
+                    by_name = conn.execute(
+                        "SELECT symbol, symbol_name FROM yahoo_category_quotes WHERE symbol_name = ? LIMIT 1;",
+                        (text,),
+                    ).fetchone()
+                    symbol = str(by_name["symbol"]) if by_name else text.upper()
+
+                if not re.fullmatch(r"[A-Z0-9._^-]{1,20}", symbol):
+                    raise ValueError("股票代碼格式不正確（請輸入英數代碼如 2330.TW 或 2303）")
+
+                exists = conn.execute("SELECT 1 FROM watchlist WHERE symbol = ?;", (symbol,)).fetchone()
+                if exists:
+                    raise ValueError(f"{symbol} 已在追蹤清單中")
+
+                # 解析中文顯示名稱
+                display_name = custom_name.strip()
+                if not display_name:
+                    cat_row = conn.execute(
+                        "SELECT symbol_name FROM yahoo_category_quotes WHERE symbol = ? LIMIT 1;",
+                        (symbol,),
+                    ).fetchone()
+                    if cat_row:
+                        display_name = str(cat_row["symbol_name"])
+                    elif symbol in SYMBOL_NAMES:
+                        display_name = SYMBOL_NAMES[symbol]
+                    else:
+                        display_name = symbol
+
+                source = self.active_source
+            finally:
+                conn.close()
+
+        # 網路抓價不可佔用 DB 鎖
+        if source == "yahoo":
+            quotes = self.yahoo_adapter.fetch_quotes([symbol])
+            validation = validate_quotes(quotes, max_daily_change_pct=0.25)
+        else:
+            quotes = self.mock_adapter.seed_history([symbol], days=30)
+            validation = validate_quotes(quotes)
+
+        with self._lock:
+            conn = get_connection(self.db_path)
+            try:
+                if validation.valid_quotes:
+                    save_validated_quotes(conn, validation)
+
+                cnt = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM market_quotes WHERE symbol = ? AND source = ?;",
+                    (symbol, source),
+                ).fetchone()["cnt"]
+                if cnt == 0:
+                    raise ValueError(f"找不到 {symbol} 的有效報價，請確認代碼是否正確")
+
+                with conn:
+                    conn.execute(
+                        "INSERT INTO watchlist (symbol, name) VALUES (?, ?);",
+                        (symbol, display_name),
+                    )
+                run_strategy_and_save(conn, {symbol: display_name}, source=source)
+            finally:
+                conn.close()
+
+        self.bump_data_version()
+        return self.get_overview()
+
+    def remove_watchlist_symbol(self, symbol: str) -> dict[str, Any]:
+        """從盤勢總覽移除指定自選股票。"""
+        sym = symbol.strip().upper()
+        with self._lock:
+            conn = get_connection(self.db_path)
+            try:
+                with conn:
+                    cur = conn.execute("DELETE FROM watchlist WHERE symbol = ?;", (sym,))
+                    if cur.rowcount == 0:
+                        raise KeyError(f"追蹤清單中找不到：{sym}")
             finally:
                 conn.close()
 
@@ -304,12 +455,16 @@ class AppService:
             conn = get_connection(self.db_path)
             try:
                 now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+                watchlist = self._get_watchlist(conn)
+                if not watchlist:
+                    return ("SUCCESS", 0, None)
+
                 if self.active_source == "yahoo":
-                    saved, issues = self._fetch_yahoo_batch(conn)
+                    saved, issues = self._fetch_yahoo_batch(conn, list(watchlist.keys()))
                     cnt = conn.execute(
                         "SELECT COUNT(*) AS cnt FROM market_quotes WHERE source = 'yahoo';"
                     ).fetchone()["cnt"]
-                    run_strategy_and_save(conn, SYMBOL_NAMES, source="yahoo")
+                    run_strategy_and_save(conn, watchlist, source="yahoo")
                     check_stop_triggers(conn, source="yahoo", now=now_utc)
                     err_msg = "；".join(issues) if issues else None
                     status = "SUCCESS" if not issues else ("PARTIAL" if cnt > 0 else "FAILED")
@@ -327,13 +482,13 @@ class AppService:
                         fetch_time = min(latest_dt + timedelta(seconds=1), now_utc + timedelta(minutes=4))
 
                 quotes = self.mock_adapter.fetch_quotes(
-                    list(SYMBOL_NAMES.keys()),
+                    list(watchlist.keys()),
                     last_closes=last_closes,
                     quote_time=fetch_time,
                 )
                 validation = validate_quotes(quotes, prev_closes=last_closes, now=now_utc)
                 saved = save_validated_quotes(conn, validation)
-                run_strategy_and_save(conn, SYMBOL_NAMES, source="mock")
+                run_strategy_and_save(conn, watchlist, source="mock")
                 check_stop_triggers(conn, source="mock", now=now_utc)
 
                 err_msg = "；".join(f"{i.symbol}: {i.reason}" for i in validation.issues) if validation.issues else None
@@ -618,7 +773,8 @@ class AppService:
         with self._lock:
             conn = get_connection(self.db_path)
             try:
-                return run_strategy_and_save(conn, SYMBOL_NAMES, source=self.active_source)
+                watchlist = self._get_watchlist(conn)
+                return run_strategy_and_save(conn, watchlist, source=self.active_source)
             finally:
                 conn.close()
 
@@ -631,8 +787,9 @@ class AppService:
             conn = get_connection(self.db_path)
             try:
                 source = self.active_source
+                watchlist = self._get_watchlist(conn)
                 stocks: list[dict[str, Any]] = []
-                for symbol, name in SYMBOL_NAMES.items():
+                for symbol, name in watchlist.items():
                     rows = conn.execute(
                         """
                         SELECT quote_time, close, volume
@@ -656,7 +813,7 @@ class AppService:
                     "latest_quote_time": max_row["max_t"] if max_row else None,
                     "stocks": stocks,
                     "daily_report": build_daily_report(stocks),
-                    "portfolio": get_portfolio(conn, SYMBOL_NAMES, source=source),
+                    "portfolio": get_portfolio(conn, watchlist, source=source),
                 }
             finally:
                 conn.close()
@@ -665,7 +822,8 @@ class AppService:
         with self._lock:
             conn = get_connection(self.db_path)
             try:
-                return evaluate_strategy_accuracy(conn, SYMBOL_NAMES, source=self.active_source, horizon_days=5)
+                watchlist = self._get_watchlist(conn)
+                return evaluate_strategy_accuracy(conn, watchlist, source=self.active_source, horizon_days=5)
             finally:
                 conn.close()
 
@@ -706,7 +864,8 @@ class AppService:
                 ).fetchall()
                 if not rows:
                     raise KeyError(f"找不到標的報價：{symbol}")
-                name = SYMBOL_NAMES.get(symbol, symbol)
+                watchlist = self._get_watchlist(conn)
+                name = watchlist.get(symbol, SYMBOL_NAMES.get(symbol, symbol))
                 analysis = analyze_quotes(symbol, name, rows)
                 closes = [float(r["close"]) for r in rows[-20:]]
                 sim = simulate_conditional_forecast(
@@ -812,6 +971,10 @@ def create_server(
                 self.wfile.write(content)
                 return
 
+            if path == "/api/stocks/search":
+                q = (query.get("q") or [""])[0].strip()
+                self._send_json(HTTPStatus.OK, {"items": service.search_stocks(q)})
+                return
             if path == "/api/overview":
                 self._send_json(HTTPStatus.OK, service.get_overview())
                 return
@@ -879,6 +1042,18 @@ def create_server(
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
+
+            if path == "/api/watchlist":
+                try:
+                    body = self._read_json()
+                    overview = service.add_watchlist_symbol(
+                        str(body.get("symbol", "")),
+                        custom_name=str(body.get("name", "")),
+                    )
+                    self._send_json(HTTPStatus.OK, overview)
+                except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
 
             if path == "/api/live":
                 try:
@@ -977,6 +1152,19 @@ def create_server(
                 return
 
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "找不到指定路徑"})
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path
+            prefix = "/api/watchlist/"
+            if not path.startswith(prefix):
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "找不到指定路徑"})
+                return
+            symbol = unquote(path[len(prefix):]).strip("/")
+            try:
+                overview = service.remove_watchlist_symbol(symbol)
+                self._send_json(HTTPStatus.OK, overview)
+            except KeyError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
 
     server = ThreadingHTTPServer((host, port), AppHandler)
     # 掛載 service 引用以便關閉時停止排程迴圈

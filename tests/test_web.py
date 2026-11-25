@@ -12,7 +12,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from app.adapters.base import Quote
-from app.db.database import get_connection
+from app.db.database import get_connection, init_db
 from app.web import SYMBOL_NAMES, create_server
 
 
@@ -180,6 +180,65 @@ class WebAppIntegrationTest(unittest.TestCase):
         tick_res = self.server.app_service.run_live_tick()  # type: ignore[attr-defined]
         self.assertGreater(tick_res["data_version"], v0)
         self.assertEqual(tick_res["tick_count"], 1)
+
+    def test_watchlist_add_remove_and_class_order(self) -> None:
+        # 1. 新增自選股 2303
+        s_add, added = self._request("POST", "/api/watchlist", {"symbol": "2303", "name": "聯電"})
+        self.assertEqual(s_add, 200)
+        self.assertTrue(any(st["symbol"] == "2303.TW" for st in added["stocks"]))
+
+        # 無效代碼應回傳 400
+        s_bad, _ = self._request("POST", "/api/watchlist", {"symbol": "BAD SYMBOL!!"})
+        self.assertEqual(s_bad, 400)
+
+        # 2. 移除自選股 2303.TW，且重跑 init_db 不會誤刪或重新復活已被清空以外的預設項目
+        req_del = Request(f"{self.base_url}/api/watchlist/2303.TW", method="DELETE")
+        with urlopen(req_del, timeout=5) as resp_del:
+            deleted = json.loads(resp_del.read().decode("utf-8"))
+            self.assertEqual(resp_del.status, 200)
+            self.assertFalse(any(st["symbol"] == "2303.TW" for st in deleted["stocks"]))
+
+        # 刪除一檔預設股後重跑 init_db，應保留使用者刪除狀態
+        req_del_0050 = Request(f"{self.base_url}/api/watchlist/0050.TW", method="DELETE")
+        with urlopen(req_del_0050, timeout=5):
+            pass
+        init_db(self.db_path)
+        _, ov_after = self._request("GET", "/api/overview")
+        self.assertFalse(any(st["symbol"] == "0050.TW" for st in ov_after["stocks"]))
+
+        # 3. 寫入非自選清單的類股成分股報價（1101.TW 台泥），驗證搜尋與模擬下單持倉名稱/現價解析
+        conn = get_connection(self.db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO yahoo_categories (category_key, group_type, name) VALUES ('sector:TAI:1', '上市', '水泥');"
+                )
+                conn.execute(
+                    """
+                    INSERT INTO yahoo_category_quotes
+                        (category_key, symbol, symbol_name, exchange, price, change_pct, volume)
+                    VALUES ('sector:TAI:1', '1101.TW', '台泥', 'TAI', 24.4, -3.17, 1000000);
+                    """
+                )
+        finally:
+            conn.close()
+
+        s_search, search_res = self._request("GET", "/api/stocks/search?q=%E5%8F%B0%E6%B3%A5")
+        self.assertEqual(s_search, 200)
+        self.assertEqual(search_res["items"][0]["symbol"], "1101.TW")
+
+        s_ord, ord_res = self._request(
+            "POST",
+            "/api/orders",
+            {"symbol": "1101.TW", "side": "BUY", "quantity": 1000, "price": 24.4, "stop_loss_price": 22.0, "confirmed_by_user": True},
+        )
+        self.assertEqual(s_ord, 200)
+        self.assertTrue(ord_res["ok"])
+
+        _, ov_pos = self._request("GET", "/api/overview")
+        pos = next(p for p in ov_pos["portfolio"]["positions"] if p["symbol"] == "1101.TW")
+        self.assertEqual(pos["name"], "台泥")
+        self.assertAlmostEqual(pos["current_price"], 24.4)
 
 
 if __name__ == "__main__":

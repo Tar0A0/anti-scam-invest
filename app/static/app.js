@@ -6,8 +6,11 @@ const state = {
   pendingOrder: null,
   classGroup: "",
   selectedCategoryKey: "",
+  allClasses: [],
+  orderClassQuotes: [],
   syncTimer: null,
   lastDataVersion: null,
+  searchTimer: null,
 };
 
 const fmtMoney = (n) => Number(n).toLocaleString("zh-TW", { maximumFractionDigits: 2 });
@@ -138,6 +141,12 @@ function renderInspector(stock) {
           switchTab("tab-forecast");
         },
       }),
+      el("button", {
+        type: "button",
+        class: "btn btn-ghost",
+        text: "移除追蹤",
+        onclick: () => removeWatchlistSymbol(stock.symbol),
+      }),
     ]),
   );
 }
@@ -236,6 +245,17 @@ function renderOverview(data) {
           ]),
         ]),
         el("td", {}, [el("span", { class: `tag tag-${s.action}`, text: s.action_label })]),
+        el("td", {}, [
+          el("button", {
+            type: "button",
+            class: "btn btn-ghost btn-sm",
+            text: "移除",
+            onclick: (ev) => {
+              ev.stopPropagation();
+              removeWatchlistSymbol(s.symbol);
+            },
+          }),
+        ]),
       ]);
     }),
   );
@@ -246,21 +266,106 @@ function renderOverview(data) {
 }
 
 function syncSymbolSelects(stocks) {
-  const orderSel = document.getElementById("order-symbol");
   const forecastSel = document.getElementById("forecast-symbol");
-  const curOrder = orderSel.value;
   const curForecast = forecastSel.value;
+  forecastSel.replaceChildren(
+    ...stocks.map((s) => el("option", { value: s.symbol, text: `${s.name} (${s.symbol}) · ${s.latest_close} 元` })),
+  );
+  if (curForecast && stocks.some((s) => s.symbol === curForecast)) {
+    forecastSel.value = curForecast;
+  }
 
-  const makeOpts = () => stocks.map((s) => el("option", { value: s.symbol, text: `${s.name} (${s.symbol}) · ${s.latest_close} 元` }));
-  orderSel.replaceChildren(...makeOpts());
-  forecastSel.replaceChildren(...makeOpts());
+  // 若目前模擬交易下拉為核心自選清單，同步更新選項
+  const catSel = document.getElementById("order-category");
+  if (!catSel.options.length) {
+    populateOrderCategories();
+  } else if (catSel.value === "__watchlist__") {
+    renderOrderSymbolOptionsFromWatchlist();
+  }
+}
 
-  if (curOrder) orderSel.value = curOrder;
-  if (curForecast) forecastSel.value = curForecast;
-
-  if (!document.getElementById("order-price").value && stocks.length) {
+function renderOrderSymbolOptionsFromWatchlist(preferredSymbol = null) {
+  const orderSel = document.getElementById("order-symbol");
+  const curOrder = preferredSymbol || orderSel.value;
+  orderSel.replaceChildren(
+    ...state.stocks.map((s) => el("option", { value: s.symbol, text: `${s.symbol} · ${s.name} (${s.latest_close} 元)` })),
+  );
+  if (curOrder && state.stocks.some((s) => s.symbol === curOrder)) {
+    orderSel.value = curOrder;
+  }
+  if (!document.getElementById("order-price").value || preferredSymbol) {
     prefillPriceForSelected();
   }
+}
+
+function populateOrderCategories(preferredCategoryKey = null) {
+  const groupVal = document.getElementById("order-group").value;
+  const catSel = document.getElementById("order-category");
+  const prevCat = preferredCategoryKey || catSel.value;
+  catSel.replaceChildren();
+
+  if (groupVal === "" || groupVal === "__watchlist__") {
+    catSel.appendChild(el("option", { value: "__watchlist__", text: `核心自選清單 (${state.stocks.length} 檔)` }));
+  }
+
+  if (groupVal !== "__watchlist__") {
+    const filtered = groupVal
+      ? state.allClasses.filter((c) => c.group_type === groupVal)
+      : state.allClasses;
+
+    const byGroup = new Map();
+    for (const c of filtered) {
+      if (!byGroup.has(c.group_type)) byGroup.set(c.group_type, []);
+      byGroup.get(c.group_type).push(c);
+    }
+
+    for (const [grpName, items] of byGroup.entries()) {
+      const og = el("optgroup", { label: grpName });
+      for (const c of items) {
+        og.appendChild(el("option", { value: c.category_key, text: `${c.name} (${c.stock_count} 檔)` }));
+      }
+      catSel.appendChild(og);
+    }
+  }
+
+  if (prevCat && [...catSel.options].some((o) => o.value === prevCat)) {
+    catSel.value = prevCat;
+  }
+  loadOrderSymbolsForCategory();
+}
+
+async function loadOrderSymbolsForCategory(preferredSymbol = null) {
+  const catKey = document.getElementById("order-category").value;
+  if (!catKey || catKey === "__watchlist__") {
+    state.orderClassQuotes = [];
+    renderOrderSymbolOptionsFromWatchlist(preferredSymbol);
+    return;
+  }
+
+  const res = await api(`/api/classes/${encodeURIComponent(catKey)}/quotes`);
+  if (!res.ok) return;
+  const quotes = (res.data.quotes || []).filter((q) => q.price !== null && q.price > 0);
+  state.orderClassQuotes = quotes;
+
+  const orderSel = document.getElementById("order-symbol");
+  const prevSym = preferredSymbol || orderSel.value;
+  if (!quotes.length) {
+    orderSel.replaceChildren(el("option", { value: "", text: "此類別尚無有效報價" }));
+    return;
+  }
+
+  orderSel.replaceChildren(
+    ...quotes.map((q) =>
+      el("option", {
+        value: q.symbol,
+        text: `${q.symbol} · ${q.symbol_name} (${fmtMoney(q.price)} 元)`,
+      }),
+    ),
+  );
+  if (prevSym && quotes.some((q) => q.symbol === prevSym)) {
+    orderSel.value = prevSym;
+  }
+  prefillPriceForSelected();
 }
 
 function setOrderSide(side) {
@@ -272,19 +377,42 @@ function setOrderSide(side) {
 
 function prefillPriceForSelected() {
   const sym = document.getElementById("order-symbol").value;
-  const found = state.stocks.find((s) => s.symbol === sym);
-  if (found) {
-    document.getElementById("order-price").value = found.latest_close;
-    document.getElementById("order-sl").value = (found.latest_close * 0.95).toFixed(2);
-    document.getElementById("order-tp").value = (found.latest_close * 1.1).toFixed(2);
+  const catKey = document.getElementById("order-category").value;
+  let price = null;
+  if (catKey && catKey !== "__watchlist__") {
+    const foundCls = state.orderClassQuotes.find((q) => q.symbol === sym);
+    if (foundCls) price = Number(foundCls.price);
+  }
+  if (price === null) {
+    const found = state.stocks.find((s) => s.symbol === sym);
+    if (found) price = Number(found.latest_close);
+  }
+  if (price !== null && price > 0) {
+    document.getElementById("order-price").value = price;
+    document.getElementById("order-sl").value = (price * 0.95).toFixed(2);
+    document.getElementById("order-tp").value = (price * 1.1).toFixed(2);
   }
 }
 
 function prefillOrder(stock) {
+  document.getElementById("order-group").value = "__watchlist__";
+  populateOrderCategories("__watchlist__");
   document.getElementById("order-symbol").value = stock.symbol;
   setOrderSide(stock.action === "SELL" ? "SELL" : "BUY");
   prefillPriceForSelected();
   switchTab("tab-trade");
+}
+
+async function removeWatchlistSymbol(symbol) {
+  const fb = document.getElementById("watchlist-feedback");
+  const res = await api(`/api/watchlist/${encodeURIComponent(symbol)}`, { method: "DELETE" });
+  if (res.ok) {
+    fb.textContent = `已從核心追蹤移除 ${symbol}。`;
+    renderOverview(res.data);
+    await loadRealityCheck();
+  } else {
+    fb.textContent = res.data.error || "移除失敗";
+  }
 }
 
 function renderPortfolioTables(portfolio) {
@@ -531,9 +659,49 @@ function wireEvents() {
     btn.addEventListener("click", () => switchTab(btn.dataset.tab));
   });
 
+  document.getElementById("order-group").addEventListener("change", () => populateOrderCategories());
+  document.getElementById("order-category").addEventListener("change", () => loadOrderSymbolsForCategory());
   document.getElementById("order-symbol").addEventListener("change", prefillPriceForSelected);
   document.getElementById("side-buy-btn").addEventListener("click", () => setOrderSide("BUY"));
   document.getElementById("side-sell-btn").addEventListener("click", () => setOrderSide("SELL"));
+
+  const wlInput = document.getElementById("watchlist-input");
+  wlInput.addEventListener("input", () => {
+    clearTimeout(state.searchTimer);
+    const q = wlInput.value.trim();
+    if (!q) return;
+    state.searchTimer = setTimeout(async () => {
+      const res = await api(`/api/stocks/search?q=${encodeURIComponent(q)}`);
+      if (!res.ok) return;
+      document.getElementById("watchlist-suggestions").replaceChildren(
+        ...(res.data.items || []).map((item) =>
+          el("option", { value: `${item.symbol} - ${item.symbol_name}` }),
+        ),
+      );
+    }, 180);
+  });
+
+  document.getElementById("watchlist-add-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fb = document.getElementById("watchlist-feedback");
+    const raw = wlInput.value.trim();
+    if (!raw) return;
+    fb.textContent = "正在抓取並驗證報價...";
+    const res = await api("/api/watchlist", {
+      method: "POST",
+      body: JSON.stringify({ symbol: raw }),
+    });
+    if (res.ok) {
+      wlInput.value = "";
+      fb.textContent = "已新增至核心追蹤清單！";
+      const stocks = res.data.stocks || [];
+      if (stocks.length) state.selectedSymbol = stocks[stocks.length - 1].symbol;
+      renderOverview(res.data);
+      await loadRealityCheck();
+    } else {
+      fb.textContent = res.data.error || "新增失敗";
+    }
+  });
 
   document.getElementById("source-select").addEventListener("change", async (e) => {
     const res = await api("/api/source", {
@@ -685,6 +853,10 @@ async function loadClasses() {
   if (!res.ok) return;
 
   const d = res.data;
+  if (!state.classGroup && !q) {
+    state.allClasses = d.categories || [];
+    populateOrderCategories();
+  }
   const totalCats = Object.values(d.group_counts).reduce((a, b) => a + b, 0);
   document.getElementById("classes-summary").textContent = d.categories.length
     ? `共 ${totalCats} 個分類 · 收錄 ${d.unique_symbols} 檔不重複台股（${d.total_quote_rows} 筆）· 更新：${d.last_updated_at || "--"}`
@@ -796,16 +968,11 @@ async function loadCategoryQuotes(categoryKey, refresh = false) {
             type: "button",
             class: "btn btn-ghost btn-sm",
             text: "帶入下單",
-            onclick: () => {
-              const sel = document.getElementById("order-symbol");
-              if (![...sel.options].some((o) => o.value === item.symbol)) {
-                sel.appendChild(el("option", { value: item.symbol, text: `${item.symbol_name} (${item.symbol}) · ${item.price} 元` }));
-              }
-              sel.value = item.symbol;
+            onclick: async () => {
+              document.getElementById("order-group").value = category.group_type || "";
+              populateOrderCategories(category.category_key);
+              await loadOrderSymbolsForCategory(item.symbol);
               setOrderSide("BUY");
-              document.getElementById("order-price").value = item.price;
-              document.getElementById("order-sl").value = (item.price * 0.95).toFixed(2);
-              document.getElementById("order-tp").value = (item.price * 1.1).toFixed(2);
               switchTab("tab-trade");
             },
           }) : el("span", { class: "muted-text", text: "--" }),
