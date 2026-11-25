@@ -462,18 +462,174 @@ function renderPortfolioTables(portfolio) {
   }
 }
 
+const JOB_LABELS = {
+  fetch_pre_market: "盤前行情抓取",
+  fetch_intraday: "盤中定時更新",
+  fetch_post_market: "盤後完整抓取",
+  run_strategy_analysis: "策略健康度評分",
+  generate_daily_report: "產出小白日報",
+  sync_yahoo_classes: "台股全類別同步",
+};
+
+const STATUS_LABELS = {
+  SUCCESS: "成功",
+  PARTIAL: "部分異常",
+  FAILED: "失敗",
+};
+
+const pad2 = (n) => String(n).padStart(2, "0");
+
+function parseCronToSimple(expr) {
+  const s = String(expr || "").trim();
+  let m = s.match(/^(\d{1,2})\s+(\d{1,2})\s+\*\s+\*\s+(1-5|\*)$/);
+  if (m) {
+    return { mode: "fixed", minute: Number(m[1]), hour: Number(m[2]), days: m[3] };
+  }
+  m = s.match(/^\*\/(\d{1,2})\s+(\d{1,2})-(\d{1,2})\s+\*\s+\*\s+(1-5|\*)$/);
+  if (m) {
+    return { mode: "interval", every: Number(m[1]), startHour: Number(m[2]), endHour: Number(m[3]), days: m[4] };
+  }
+  m = s.match(/^0\s+(\d{1,2})-(\d{1,2})\s+\*\s+\*\s+(1-5|\*)$/);
+  if (m) {
+    return { mode: "interval", every: 60, startHour: Number(m[1]), endHour: Number(m[2]), days: m[3] };
+  }
+  return { mode: "custom", raw: s };
+}
+
+function simpleToCron(cfg) {
+  if (cfg.mode === "fixed") {
+    return `${Number(cfg.minute)} ${Number(cfg.hour)} * * ${cfg.days}`;
+  }
+  if (cfg.mode === "interval") {
+    const start = Number(cfg.startHour);
+    const end = Math.max(start, Number(cfg.endHour));
+    const every = Number(cfg.every);
+    if (every === 60) return `0 ${start}-${end} * * ${cfg.days}`;
+    return `*/${every} ${start}-${end} * * ${cfg.days}`;
+  }
+  return String(cfg.raw || "").trim();
+}
+
+function describeSchedule(cfg) {
+  const daysText = cfg.days === "1-5" ? "週一至週五（開盤日）" : "每天";
+  if (cfg.mode === "fixed") {
+    return `${daysText} ${pad2(cfg.hour)}:${pad2(cfg.minute)} 執行一次`;
+  }
+  if (cfg.mode === "interval") {
+    const start = Number(cfg.startHour);
+    const end = Math.max(start, Number(cfg.endHour));
+    return `${daysText} ${pad2(start)}:00–${pad2(end)}:59 每 ${cfg.every} 分鐘輪詢`;
+  }
+  return `進階設定（${cfg.raw}）`;
+}
+
+function buildScheduleEditor(cronExpr) {
+  let cfg = parseCronToSimple(cronExpr);
+  if (cfg.mode === "custom") {
+    cfg = { mode: "custom", raw: cronExpr, hour: 9, minute: 0, every: 15, startHour: 9, endHour: 13, days: "1-5" };
+  } else {
+    cfg = { hour: 9, minute: 0, every: 15, startHour: 9, endHour: 13, days: "1-5", ...cfg };
+  }
+
+  const modeSel = el("select", { "aria-label": "執行方式" }, [
+    el("option", { value: "fixed", text: "固定時間" }),
+    el("option", { value: "interval", text: "時段輪詢" }),
+    ...(cfg.mode === "custom" ? [el("option", { value: "custom", text: "進階格式" })] : []),
+  ]);
+  modeSel.value = cfg.mode;
+
+  const daysSel = el("select", { "aria-label": "執行星期" }, [
+    el("option", { value: "1-5", text: "週一至週五（開盤日）" }),
+    el("option", { value: "*", text: "每天" }),
+  ]);
+  daysSel.value = cfg.days;
+
+  const timeInput = el("input", {
+    type: "time",
+    class: "mono",
+    "aria-label": "執行時間",
+    value: `${pad2(cfg.hour)}:${pad2(cfg.minute)}`,
+  });
+
+  const everySel = el("select", { "aria-label": "輪詢間隔" }, [
+    ...[5, 10, 15, 30, 60].map((m) => el("option", { value: String(m), text: `每 ${m} 分鐘` })),
+  ]);
+  if (![5, 10, 15, 30, 60].includes(cfg.every)) {
+    everySel.appendChild(el("option", { value: String(cfg.every), text: `每 ${cfg.every} 分鐘` }));
+  }
+  everySel.value = String(cfg.every);
+
+  const hourOpts = () =>
+    Array.from({ length: 24 }, (_, h) => el("option", { value: String(h), text: `${pad2(h)}:00` }));
+  const startSel = el("select", { "aria-label": "開始小時" }, hourOpts());
+  startSel.value = String(cfg.startHour);
+  const endSel = el("select", { "aria-label": "結束小時" }, hourOpts());
+  endSel.value = String(cfg.endHour);
+
+  const customInput = el("input", { type: "text", class: "mono input-compact", value: cfg.raw || cronExpr });
+  const previewEl = el("div", { class: "sched-preview" });
+  const controlsRow = el("div", { class: "sched-controls" });
+
+  function readCfg() {
+    const mode = modeSel.value;
+    if (mode === "fixed") {
+      const [hh, mm] = (timeInput.value || "09:00").split(":").map(Number);
+      return { mode, hour: hh || 0, minute: mm || 0, days: daysSel.value };
+    }
+    if (mode === "interval") {
+      const startHour = Number(startSel.value);
+      const endHour = Math.max(startHour, Number(endSel.value));
+      endSel.value = String(endHour);
+      return { mode, every: Number(everySel.value), startHour, endHour, days: daysSel.value };
+    }
+    return { mode: "custom", raw: customInput.value };
+  }
+
+  function syncLayout() {
+    const mode = modeSel.value;
+    if (mode === "fixed") {
+      controlsRow.replaceChildren(daysSel, modeSel, timeInput);
+    } else if (mode === "interval") {
+      controlsRow.replaceChildren(
+        daysSel,
+        modeSel,
+        startSel,
+        el("span", { class: "sched-sep", text: "到" }),
+        endSel,
+        everySel,
+      );
+    } else {
+      controlsRow.replaceChildren(modeSel, customInput);
+    }
+    previewEl.textContent = describeSchedule(readCfg());
+  }
+
+  [modeSel, daysSel, timeInput, everySel, startSel, endSel, customInput].forEach((ctrl) => {
+    ctrl.addEventListener("change", syncLayout);
+  });
+  syncLayout();
+
+  return {
+    root: el("div", { class: "sched-editor" }, [controlsRow, previewEl]),
+    getCron: () => simpleToCron(readCfg()),
+  };
+}
+
 function renderSchedules(data) {
   const schedBody = document.getElementById("schedules-body");
   schedBody.replaceChildren(
     ...data.schedules.map((s) => {
-      const cronInput = el("input", { type: "text", class: "mono input-compact", value: s.cron_expr });
+      const editor = buildScheduleEditor(s.cron_expr);
       const enabledChk = el("input", { type: "checkbox" });
       enabledChk.checked = Boolean(s.enabled);
+      const friendlyName = JOB_LABELS[s.job_name] || s.job_name;
 
       return el("tr", {}, [
-        el("td", { class: "mono", text: s.job_name }),
-        el("td", { class: "wrap-cell", text: s.description }),
-        el("td", {}, [cronInput]),
+        el("td", { class: "wrap-cell" }, [
+          el("strong", { text: friendlyName }),
+          el("div", { class: "muted-text", style: "font-size: 0.76rem;", text: s.description }),
+        ]),
+        el("td", {}, [editor.root]),
         el("td", {}, [enabledChk]),
         el("td", {}, [
           el("div", { class: "btn-group" }, [
@@ -485,9 +641,9 @@ function renderSchedules(data) {
                 const fb = document.getElementById("schedule-feedback");
                 const res = await api(`/api/schedules/${encodeURIComponent(s.job_name)}`, {
                   method: "PUT",
-                  body: JSON.stringify({ cron_expr: cronInput.value, enabled: enabledChk.checked }),
+                  body: JSON.stringify({ cron_expr: editor.getCron(), enabled: enabledChk.checked }),
                 });
-                fb.textContent = res.ok ? `已更新 ${s.job_name} 排程設定。` : `更新失敗：${res.data.error}`;
+                fb.textContent = res.ok ? `已更新「${friendlyName}」排程設定。` : `更新失敗：${res.data.error}`;
                 if (res.ok) await loadSchedules();
               },
             }),
@@ -499,7 +655,7 @@ function renderSchedules(data) {
                 const fb = document.getElementById("schedule-feedback");
                 const res = await api(`/api/schedules/${encodeURIComponent(s.job_name)}/run`, { method: "POST" });
                 fb.textContent = res.ok
-                  ? `已手動執行 ${s.job_name}：狀態 ${res.data.status}，處理 ${res.data.records_processed} 筆 (${res.data.duration_ms} ms)`
+                  ? `已手動執行「${friendlyName}」：${STATUS_LABELS[res.data.status] || res.data.status}，處理 ${res.data.records_processed} 筆 (${res.data.duration_ms} ms)`
                   : `執行失敗：${res.data.error}`;
                 await Promise.all([loadOverview(), loadSchedules()]);
               },
@@ -518,9 +674,9 @@ function renderSchedules(data) {
       ...data.logs.map((l) =>
         el("tr", {}, [
           el("td", { class: "mono", text: l.started_at }),
-          el("td", { class: "mono", text: l.job_name }),
+          el("td", { text: JOB_LABELS[l.job_name] || l.job_name }),
           el("td", { text: l.trigger_type === "manual" ? "手動重跑" : "定時排程" }),
-          el("td", {}, [el("span", { class: `tag tag-${l.status}`, text: l.status })]),
+          el("td", {}, [el("span", { class: `tag tag-${l.status}`, text: STATUS_LABELS[l.status] || l.status })]),
           el("td", { class: "num", text: `${l.duration_ms} ms / 重試 ${l.retry_count}` }),
           el("td", { class: "wrap-cell", text: l.error_message || `處理 ${l.records_processed} 筆` }),
         ]),

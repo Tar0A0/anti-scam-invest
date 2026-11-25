@@ -367,6 +367,36 @@ body {
   gap: 6px;
 }
 
+.sched-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.sched-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.sched-controls select, .sched-controls input[type="time"] {
+  height: 30px !important;
+  padding: 0 8px !important;
+  font-size: 0.82rem !important;
+}
+
+.sched-sep {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.sched-preview {
+  font-size: 0.76rem;
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .editorial-brief {
   background: var(--surface);
   border: 1px solid var(--border);

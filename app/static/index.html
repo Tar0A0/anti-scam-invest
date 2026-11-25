@@ -397,14 +397,18 @@
         <!-- 分頁 5：排程紀錄 -->
         <section id="tab-scheduler" class="tab-panel">
           <section class="panel" style="margin-bottom: 16px;">
-            <h2>定時排程設定 (台北時間 UTC+8)</h2>
+            <div class="panel-head">
+              <div>
+                <h2>定時排程設定 (台北時間)</h2>
+                <p class="muted-text">直接選擇每天執行時間或盤中輪詢頻率，系統會於開啟期間自動依表執行。</p>
+              </div>
+            </div>
             <div class="table-wrap">
               <table class="data-table">
                 <thead>
                   <tr>
-                    <th>任務名稱</th>
-                    <th>說明</th>
-                    <th>Cron (分 時 日 月 週)</th>
+                    <th>排程項目</th>
+                    <th>執行時間設定</th>
                     <th>啟用</th>
                     <th>操作</th>
                   </tr>
@@ -416,17 +420,17 @@
           </section>
 
           <section class="panel">
-            <h2>執行狀態稽核日誌 (最近 30 筆)</h2>
+            <h2>執行狀態紀錄 (最近 30 筆)</h2>
             <div class="table-wrap">
               <table class="data-table">
                 <thead>
                   <tr>
-                    <th>觸發時間 (UTC)</th>
-                    <th>任務</th>
+                    <th>執行時間 (UTC)</th>
+                    <th>排程項目</th>
                     <th>觸發方式</th>
-                    <th>狀態</th>
+                    <th>結果</th>
                     <th class="num">耗時 / 重試</th>
-                    <th>結果 / 錯誤摘要</th>
+                    <th>處理說明</th>
                   </tr>
                 </thead>
                 <tbody id="logs-body"></tbody>
