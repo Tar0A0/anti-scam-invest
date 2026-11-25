@@ -2,6 +2,7 @@
 
 const state = {
   stocks: [],
+  selectedSymbol: null,
   pendingOrder: null,
   classGroup: "",
   selectedCategoryKey: "",
@@ -10,7 +11,7 @@ const state = {
 
 const fmtMoney = (n) => Number(n).toLocaleString("zh-TW", { maximumFractionDigits: 2 });
 
-/** 安全建立 DOM 節點，全部文字皆透過 textContent 寫入以避免 XSS。 */
+/** 安全建立 DOM 節點，全部動態文字皆透過 textContent 寫入以避免 XSS。 */
 function el(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -35,40 +36,124 @@ async function api(url, options = {}) {
   return { ok: res.ok, status: res.status, data };
 }
 
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  localStorage.setItem("stockmate-theme", theme);
+  const label = document.getElementById("theme-label");
+  if (label) label.textContent = theme === "dark" ? "淺色紙面模式" : "深色終端模式";
+}
+
 function buildSparkline(values, isUp) {
   const svgNS = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(svgNS, "svg");
-  svg.setAttribute("viewBox", "0 0 200 48");
+  svg.setAttribute("viewBox", "0 0 120 32");
   svg.setAttribute("class", "sparkline");
+  svg.setAttribute("aria-hidden", "true");
   if (!values || values.length < 2) return svg;
 
   const min = Math.min(...values);
   const max = Math.max(...values);
   const span = max - min || 1;
-  const pts = values
-    .map((v, i) => {
-      const x = (i / (values.length - 1)) * 196 + 2;
-      const y = 44 - ((v - min) / span) * 40;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
+  const coords = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * 116 + 2;
+    const y = 28 - ((v - min) / span) * 24;
+    return [Number(x.toFixed(1)), Number(y.toFixed(1))];
+  });
+  const pts = coords.map(([x, y]) => `${x},${y}`).join(" ");
+  const color = isUp ? "var(--up)" : "var(--down)";
+
+  const area = document.createElementNS(svgNS, "polygon");
+  area.setAttribute("points", `2,30 ${pts} 118,30`);
+  area.setAttribute("fill", color);
+  area.setAttribute("fill-opacity", "0.10");
 
   const poly = document.createElementNS(svgNS, "polyline");
   poly.setAttribute("fill", "none");
-  poly.setAttribute("stroke", isUp ? "#dc2626" : "#059669");
-  poly.setAttribute("stroke-width", "2.2");
+  poly.setAttribute("stroke", color);
+  poly.setAttribute("stroke-width", "1.6");
   poly.setAttribute("points", pts);
-  svg.appendChild(poly);
+
+  svg.append(area, poly);
   return svg;
+}
+
+function renderInspector(stock) {
+  const panel = document.getElementById("stock-inspector");
+  if (!stock) {
+    panel.replaceChildren(el("p", { class: "muted-text", text: "請選擇左側標的檢視詳細診斷。" }));
+    return;
+  }
+
+  const chgCls = stock.change_pct >= 0 ? "pos" : "neg";
+  panel.replaceChildren(
+    el("div", { class: "inspector-header" }, [
+      el("div", {}, [
+        el("span", { class: "eyebrow", text: `${stock.symbol} · ${stock.ma_trend}` }),
+        el("h2", { style: "font-size: 1.2rem; margin-top: 2px;", text: stock.name }),
+        el("div", { style: "margin-top: 6px;" }, [
+          el("span", { class: `tag tag-${stock.action}`, text: `建議：${stock.action_label}` }),
+        ]),
+      ]),
+      el("div", { class: `inspector-price mono ${chgCls}` }, [
+        el("div", { text: `${fmtMoney(stock.latest_close)}` }),
+        el("div", {
+          style: "font-size: 0.84rem; margin-top: 2px;",
+          text: `${stock.change_pct >= 0 ? "+" : ""}${stock.change_pct}%`,
+        }),
+      ]),
+    ]),
+    el("div", { class: "metric-grid" }, [
+      el("div", { class: "metric-box" }, [
+        el("span", { text: "健康度評分" }),
+        el("strong", { class: "mono", text: `${stock.health_score} / 100` }),
+      ]),
+      el("div", { class: "metric-box" }, [
+        el("span", { text: "月線 MA20 / 乖離" }),
+        el("strong", { class: "mono", text: `${fmtMoney(stock.ma20)} (${stock.bias_pct >= 0 ? "+" : ""}${stock.bias_pct}%)` }),
+      ]),
+      el("div", { class: "metric-box" }, [
+        el("span", { text: "成交量能倍數" }),
+        el("strong", { class: "mono", text: `${stock.volume_ratio}x` }),
+      ]),
+      el("div", { class: "metric-box" }, [
+        el("span", { text: "近 10 日上漲勝率" }),
+        el("strong", { class: "mono", text: `${stock.win_rate_nd}%` }),
+      ]),
+    ]),
+    el("p", { class: "rationale-box", text: stock.plain_reason }),
+    el("div", { class: "btn-group" }, [
+      el("button", {
+        type: "button",
+        class: "btn btn-primary",
+        text: "前往模擬下單",
+        onclick: () => prefillOrder(stock),
+      }),
+      el("button", {
+        type: "button",
+        class: "btn btn-ghost",
+        text: "情境壓力測試",
+        onclick: () => {
+          document.getElementById("forecast-symbol").value = stock.symbol;
+          switchTab("tab-forecast");
+        },
+      }),
+    ]),
+  );
 }
 
 function renderOverview(data) {
   const { portfolio, daily_report: report, stocks } = data;
   state.stocks = stocks;
 
-  // 資料源切換與降級提示
+  // 資料源指示與降級提示
   const sourceSel = document.getElementById("source-select");
   if (data.active_source) sourceSel.value = data.active_source;
+  const dot = document.getElementById("source-dot");
+  dot.classList.toggle("mock", data.active_source === "mock");
+
+  document.getElementById("latest-quote-pill").textContent = data.latest_quote_time
+    ? `報價 ${data.latest_quote_time}`
+    : report.report_date;
 
   const noticeBanner = document.getElementById("source-notice-banner");
   if (data.source_notice) {
@@ -78,7 +163,6 @@ function renderOverview(data) {
     noticeBanner.classList.add("hidden");
   }
 
-  // 冷靜鎖定橫幅
   const banner = document.getElementById("lockout-banner");
   if (portfolio.active_lockout) {
     banner.textContent = `冷靜保護中（暫停買進至 ${portfolio.active_lockout.unlock_at}）：${portfolio.active_lockout.reason}`;
@@ -87,71 +171,75 @@ function renderOverview(data) {
     banner.classList.add("hidden");
   }
 
-  // KPI
+  // 帳戶摘要條
   document.getElementById("kpi-equity").textContent = `${fmtMoney(portfolio.total_equity)} 元`;
   document.getElementById("kpi-return").textContent = `累計報酬 ${portfolio.total_return_pct >= 0 ? "+" : ""}${portfolio.total_return_pct}%`;
   document.getElementById("kpi-cash").textContent = `${fmtMoney(portfolio.cash_balance)} 元`;
   const pnlEl = document.getElementById("kpi-pnl");
   pnlEl.textContent = `${portfolio.daily_realized_pnl >= 0 ? "+" : ""}${fmtMoney(portfolio.daily_realized_pnl)} 元`;
+  pnlEl.className = `strip-value mono ${portfolio.daily_realized_pnl >= 0 ? "pos" : "neg"}`;
   document.getElementById("kpi-health").textContent = `${report.avg_health_score} / 100`;
   document.getElementById("kpi-health-note").textContent = data.source_label || report.report_date;
 
-  // 白話日報
+  // 報社盤後摘要
   document.getElementById("report-headline").textContent = report.headline;
-  document.getElementById("report-date").textContent = data.latest_quote_time
-    ? `最新報價 ${data.latest_quote_time}`
-    : report.report_date;
+  document.getElementById("report-date").textContent = report.report_date;
   document.getElementById("report-summary").textContent = report.summary;
-  const chips = document.getElementById("report-counts");
-  chips.replaceChildren(
-    el("span", { class: "badge badge-HEAVY_BUY", text: `重壓 ${report.counts.HEAVY_BUY || 0}` }),
-    el("span", { class: "badge badge-ADD", text: `補倉 ${report.counts.ADD || 0}` }),
-    el("span", { class: "badge badge-HOLD", text: `繼續蹲 ${report.counts.HOLD || 0}` }),
-    el("span", { class: "badge badge-SELL", text: `拋出 ${report.counts.SELL || 0}` }),
+  document.getElementById("report-counts").replaceChildren(
+    el("span", { class: "tag tag-HEAVY_BUY", text: `重壓 ${report.counts.HEAVY_BUY || 0}` }),
+    el("span", { class: "tag tag-ADD", text: `補倉 ${report.counts.ADD || 0}` }),
+    el("span", { class: "tag tag-HOLD", text: `繼續蹲 ${report.counts.HOLD || 0}` }),
+    el("span", { class: "tag tag-SELL", text: `拋出 ${report.counts.SELL || 0}` }),
   );
 
-  // 標的卡片
-  const grid = document.getElementById("stock-grid");
-  grid.replaceChildren(
+  // 確保選中有效標的
+  if (!state.selectedSymbol || !stocks.some((s) => s.symbol === state.selectedSymbol)) {
+    state.selectedSymbol = stocks.length ? stocks[0].symbol : null;
+  }
+
+  const tbody = document.getElementById("watchlist-body");
+  tbody.replaceChildren(
     ...stocks.map((s) => {
-      const fill = el("div", { class: "health-bar-fill" });
+      const chgCls = s.change_pct >= 0 ? "pos" : "neg";
+      const fill = el("div", { class: "health-fill" });
       fill.style.width = `${s.health_score}%`;
 
-      return el("article", { class: "stock-card" }, [
-        el("div", { class: "stock-top" }, [
-          el("div", {}, [
-            el("h3", { class: "stock-name", text: s.name }),
-            el("span", { class: "stock-code", text: `${s.symbol} · ${s.ma_trend}` }),
+      return el("tr", {
+        class: `watch-row ${s.symbol === state.selectedSymbol ? "selected" : ""}`,
+        tabindex: "0",
+        onclick: () => {
+          state.selectedSymbol = s.symbol;
+          renderOverview(data);
+        },
+        onkeydown: (ev) => {
+          if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault();
+            state.selectedSymbol = s.symbol;
+            renderOverview(data);
+          }
+        },
+      }, [
+        el("td", {}, [
+          el("strong", { text: s.name }),
+          el("div", { class: "mono muted-text", style: "font-size: 0.74rem;", text: s.symbol }),
+        ]),
+        el("td", {}, [buildSparkline(s.sparkline, s.change_pct >= 0)]),
+        el("td", { class: `num ${chgCls}` }, [
+          el("div", { style: "font-weight: 600;", text: fmtMoney(s.latest_close) }),
+          el("div", { style: "font-size: 0.76rem;", text: `${s.change_pct >= 0 ? "+" : ""}${s.change_pct}%` }),
+        ]),
+        el("td", { class: "num" }, [
+          el("div", { class: "health-mini" }, [
+            el("div", { class: "health-track" }, [fill]),
+            el("span", { text: `${s.health_score}` }),
           ]),
-          el("div", { class: "stock-price" }, [
-            el("div", { text: `${fmtMoney(s.latest_close)} 元` }),
-            el("div", {
-              class: `stock-change ${s.change_pct >= 0 ? "pos" : "neg"}`,
-              text: `${s.change_pct >= 0 ? "+" : ""}${s.change_pct}%`,
-            }),
-          ]),
         ]),
-        buildSparkline(s.sparkline, s.change_pct >= 0),
-        el("div", { class: "stock-meta" }, [
-          el("span", { text: `健康度 ${s.health_score} 分` }),
-          el("span", { class: `badge badge-${s.action}`, text: `建議：${s.action_label}` }),
-        ]),
-        el("div", { class: "health-bar-wrap" }, [fill]),
-        el("div", { class: "stock-meta" }, [
-          el("span", { text: `月線乖離 ${s.bias_pct >= 0 ? "+" : ""}${s.bias_pct}%` }),
-          el("span", { text: `量比 ${s.volume_ratio}x · 勝率 ${s.win_rate_nd}%` }),
-        ]),
-        el("p", { class: "stock-reason", text: s.plain_reason }),
-        el("button", {
-          class: "btn btn-outline btn-sm",
-          type: "button",
-          text: "帶入模擬下單",
-          onclick: () => prefillOrder(s),
-        }),
+        el("td", {}, [el("span", { class: `tag tag-${s.action}`, text: s.action_label })]),
       ]);
     }),
   );
 
+  renderInspector(stocks.find((s) => s.symbol === state.selectedSymbol) || null);
   syncSymbolSelects(stocks);
   renderPortfolioTables(portfolio);
 }
@@ -174,6 +262,13 @@ function syncSymbolSelects(stocks) {
   }
 }
 
+function setOrderSide(side) {
+  const normalized = side === "SELL" ? "SELL" : "BUY";
+  document.getElementById("order-side").value = normalized;
+  document.getElementById("side-buy-btn").classList.toggle("active-buy", normalized === "BUY");
+  document.getElementById("side-sell-btn").classList.toggle("active-sell", normalized === "SELL");
+}
+
 function prefillPriceForSelected() {
   const sym = document.getElementById("order-symbol").value;
   const found = state.stocks.find((s) => s.symbol === sym);
@@ -186,7 +281,7 @@ function prefillPriceForSelected() {
 
 function prefillOrder(stock) {
   document.getElementById("order-symbol").value = stock.symbol;
-  document.getElementById("order-side").value = stock.action === "SELL" ? "SELL" : "BUY";
+  setOrderSide(stock.action === "SELL" ? "SELL" : "BUY");
   prefillPriceForSelected();
   switchTab("tab-trade");
 }
@@ -195,20 +290,20 @@ function renderPortfolioTables(portfolio) {
   const posBody = document.getElementById("positions-body");
   if (!portfolio.positions.length) {
     posBody.replaceChildren(
-      el("tr", {}, [el("td", { colspan: "5", class: "muted", text: "目前尚無模擬持倉，可於左側試著買進第一筆。" })]),
+      el("tr", {}, [el("td", { colspan: "5", class: "muted-text", text: "目前尚無模擬持倉，可於左側試著買進第一筆。" })]),
     );
   } else {
     posBody.replaceChildren(
       ...portfolio.positions.map((p) =>
         el("tr", {}, [
           el("td", { text: `${p.name} (${p.symbol})` }),
-          el("td", { text: `${p.quantity}` }),
-          el("td", { text: `${p.avg_cost} / ${p.current_price}` }),
+          el("td", { class: "num", text: `${p.quantity}` }),
+          el("td", { class: "num", text: `${p.avg_cost} / ${p.current_price}` }),
           el("td", {
-            class: p.unrealized_pnl >= 0 ? "pos" : "neg",
+            class: `num ${p.unrealized_pnl >= 0 ? "pos" : "neg"}`,
             text: `${p.unrealized_pnl >= 0 ? "+" : ""}${fmtMoney(p.unrealized_pnl)} (${p.unrealized_pct}%)`,
           }),
-          el("td", { text: `${p.stop_loss_price ?? "--"} / ${p.take_profit_price ?? "--"}` }),
+          el("td", { class: "num", text: `${p.stop_loss_price ?? "--"} / ${p.take_profit_price ?? "--"}` }),
         ]),
       ),
     );
@@ -217,19 +312,19 @@ function renderPortfolioTables(portfolio) {
   const ordBody = document.getElementById("orders-body");
   if (!portfolio.recent_orders.length) {
     ordBody.replaceChildren(
-      el("tr", {}, [el("td", { colspan: "6", class: "muted", text: "尚無下單紀錄。" })]),
+      el("tr", {}, [el("td", { colspan: "6", class: "muted-text", text: "尚無下單紀錄。" })]),
     );
   } else {
     ordBody.replaceChildren(
       ...portfolio.recent_orders.map((o) =>
         el("tr", {}, [
-          el("td", { text: o.created_at }),
-          el("td", { text: o.symbol }),
+          el("td", { class: "mono", text: o.created_at }),
+          el("td", { class: "mono", text: o.symbol }),
           el("td", { text: `${o.side} (${o.order_type})` }),
-          el("td", { text: `${o.quantity} × ${o.price}` }),
-          el("td", { text: `${fmtMoney(o.max_loss_estimate)} 元` }),
+          el("td", { class: "num", text: `${o.quantity} × ${o.price}` }),
+          el("td", { class: "num", text: `${fmtMoney(o.max_loss_estimate)} 元` }),
           el("td", { class: "wrap-cell" }, [
-            el("span", { class: `badge badge-${o.status}`, text: o.status }),
+            el("span", { class: `tag tag-${o.status}`, text: o.status }),
             o.reject_reason ? el("span", { text: ` ${o.reject_reason}` }) : null,
           ]),
         ]),
@@ -242,44 +337,45 @@ function renderSchedules(data) {
   const schedBody = document.getElementById("schedules-body");
   schedBody.replaceChildren(
     ...data.schedules.map((s) => {
-      const cronInput = el("input", { type: "text", value: s.cron_expr });
+      const cronInput = el("input", { type: "text", class: "mono input-compact", value: s.cron_expr });
       const enabledChk = el("input", { type: "checkbox" });
       enabledChk.checked = Boolean(s.enabled);
 
       return el("tr", {}, [
-        el("td", { text: s.job_name }),
+        el("td", { class: "mono", text: s.job_name }),
         el("td", { class: "wrap-cell", text: s.description }),
         el("td", {}, [cronInput]),
         el("td", {}, [enabledChk]),
         el("td", {}, [
-          el("button", {
-            class: "btn btn-outline btn-sm",
-            type: "button",
-            text: "儲存",
-            onclick: async () => {
-              const fb = document.getElementById("schedule-feedback");
-              const res = await api(`/api/schedules/${encodeURIComponent(s.job_name)}`, {
-                method: "PUT",
-                body: JSON.stringify({ cron_expr: cronInput.value, enabled: enabledChk.checked }),
-              });
-              fb.textContent = res.ok ? `已更新 ${s.job_name} 排程設定。` : `更新失敗：${res.data.error}`;
-              if (res.ok) await loadSchedules();
-            },
-          }),
-          " ",
-          el("button", {
-            class: "btn btn-primary btn-sm",
-            type: "button",
-            text: "立即執行",
-            onclick: async () => {
-              const fb = document.getElementById("schedule-feedback");
-              const res = await api(`/api/schedules/${encodeURIComponent(s.job_name)}/run`, { method: "POST" });
-              fb.textContent = res.ok
-                ? `已手動執行 ${s.job_name}：狀態 ${res.data.status}，處理 ${res.data.records_processed} 筆 (${res.data.duration_ms} ms)`
-                : `執行失敗：${res.data.error}`;
-              await Promise.all([loadOverview(), loadSchedules()]);
-            },
-          }),
+          el("div", { class: "btn-group" }, [
+            el("button", {
+              class: "btn btn-ghost btn-sm",
+              type: "button",
+              text: "儲存",
+              onclick: async () => {
+                const fb = document.getElementById("schedule-feedback");
+                const res = await api(`/api/schedules/${encodeURIComponent(s.job_name)}`, {
+                  method: "PUT",
+                  body: JSON.stringify({ cron_expr: cronInput.value, enabled: enabledChk.checked }),
+                });
+                fb.textContent = res.ok ? `已更新 ${s.job_name} 排程設定。` : `更新失敗：${res.data.error}`;
+                if (res.ok) await loadSchedules();
+              },
+            }),
+            el("button", {
+              class: "btn btn-primary btn-sm",
+              type: "button",
+              text: "立即執行",
+              onclick: async () => {
+                const fb = document.getElementById("schedule-feedback");
+                const res = await api(`/api/schedules/${encodeURIComponent(s.job_name)}/run`, { method: "POST" });
+                fb.textContent = res.ok
+                  ? `已手動執行 ${s.job_name}：狀態 ${res.data.status}，處理 ${res.data.records_processed} 筆 (${res.data.duration_ms} ms)`
+                  : `執行失敗：${res.data.error}`;
+                await Promise.all([loadOverview(), loadSchedules()]);
+              },
+            }),
+          ]),
         ]),
       ]);
     }),
@@ -287,16 +383,16 @@ function renderSchedules(data) {
 
   const logsBody = document.getElementById("logs-body");
   if (!data.logs.length) {
-    logsBody.replaceChildren(el("tr", {}, [el("td", { colspan: "6", class: "muted", text: "尚無排程執行紀錄。" })]));
+    logsBody.replaceChildren(el("tr", {}, [el("td", { colspan: "6", class: "muted-text", text: "尚無排程執行紀錄。" })]));
   } else {
     logsBody.replaceChildren(
       ...data.logs.map((l) =>
         el("tr", {}, [
-          el("td", { text: l.started_at }),
-          el("td", { text: l.job_name }),
+          el("td", { class: "mono", text: l.started_at }),
+          el("td", { class: "mono", text: l.job_name }),
           el("td", { text: l.trigger_type === "manual" ? "手動重跑" : "定時排程" }),
-          el("td", {}, [el("span", { class: `badge badge-${l.status}`, text: l.status })]),
-          el("td", { text: `${l.duration_ms} ms / 重試 ${l.retry_count}` }),
+          el("td", {}, [el("span", { class: `tag tag-${l.status}`, text: l.status })]),
+          el("td", { class: "num", text: `${l.duration_ms} ms / 重試 ${l.retry_count}` }),
           el("td", { class: "wrap-cell", text: l.error_message || `處理 ${l.records_processed} 筆` }),
         ]),
       ),
@@ -321,24 +417,25 @@ async function loadRealityCheck() {
   const summaryEl = document.getElementById("reality-summary");
   summaryEl.replaceChildren(
     el("strong", {
-      text: `資料源：${d.source} ｜ 方向命中率：${d.accuracy_pct}%（${d.directional_signals} 次方向訊號）｜ 平均訊號報酬：${d.avg_signal_return_pct >= 0 ? "+" : ""}${d.avg_signal_return_pct}% ｜ 平均 ${d.horizon_days} 日波動幅度：${d.mae_pct}%`,
+      class: "mono",
+      text: `資料源 ${d.source} ｜ 方向命中率 ${d.accuracy_pct}%（${d.directional_signals} 筆訊號）｜ 平均報酬 ${d.avg_signal_return_pct >= 0 ? "+" : ""}${d.avg_signal_return_pct}% ｜ 平均 ${d.horizon_days} 日波動 ${d.mae_pct}%`,
     }),
-    el("p", { style: "margin: 6px 0 0; color: #334155;", text: d.calibration_hint }),
+    el("p", { style: "margin: 6px 0 0;", text: d.calibration_hint }),
   );
 
   const body = document.getElementById("reality-body");
   if (!d.per_symbol.length) {
-    body.replaceChildren(el("tr", {}, [el("td", { colspan: "4", class: "muted", text: "歷史資料筆數尚不足 25 筆，暫無法計算回測。" })]));
+    body.replaceChildren(el("tr", {}, [el("td", { colspan: "4", class: "muted-text", text: "歷史資料筆數尚不足 25 筆，暫無法計算回測。" })]));
     return;
   }
   body.replaceChildren(
     ...d.per_symbol.map((r) =>
       el("tr", {}, [
         el("td", { text: `${r.name} (${r.symbol})` }),
-        el("td", { text: `${r.directional_signals}` }),
-        el("td", { text: r.accuracy_pct !== null ? `${r.accuracy_pct}%` : "無方向訊號" }),
+        el("td", { class: "num", text: `${r.directional_signals}` }),
+        el("td", { class: "num", text: r.accuracy_pct !== null ? `${r.accuracy_pct}%` : "無方向訊號" }),
         el("td", {
-          class: (r.avg_signal_return_pct || 0) >= 0 ? "pos" : "neg",
+          class: `num ${(r.avg_signal_return_pct || 0) >= 0 ? "pos" : "neg"}`,
           text: r.avg_signal_return_pct !== null ? `${r.avg_signal_return_pct >= 0 ? "+" : ""}${r.avg_signal_return_pct}%` : "--",
         }),
       ]),
@@ -347,7 +444,14 @@ async function loadRealityCheck() {
 }
 
 function switchTab(tabId) {
-  document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tabId));
+  document.querySelectorAll(".nav-btn").forEach((b) => {
+    const active = b.dataset.tab === tabId;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", active ? "true" : "false");
+    if (active && b.dataset.title) {
+      document.getElementById("page-title").textContent = b.dataset.title;
+    }
+  });
   document.querySelectorAll(".tab-panel").forEach((p) => p.classList.toggle("active", p.id === tabId));
 }
 
@@ -355,12 +459,13 @@ function openConfirmModal(orderPayload, check) {
   state.pendingOrder = orderPayload;
   const sideZh = orderPayload.side === "BUY" ? "買進" : "賣出";
   document.getElementById("modal-summary").textContent =
-    `準備${sideZh} ${orderPayload.symbol} 共 ${orderPayload.quantity} 股，單價 ${orderPayload.price} 元（總金額 ${fmtMoney(orderPayload.quantity * orderPayload.price)} 元）。`;
+    `準備${sideZh} ${orderPayload.symbol} 共 ${orderPayload.quantity} 股，單價 ${orderPayload.price} 元（委託總額 ${fmtMoney(orderPayload.quantity * orderPayload.price)} 元）。`;
   document.getElementById("modal-max-loss").textContent = `${fmtMoney(check.max_loss_estimate)} 元`;
 
   const list = document.getElementById("modal-reasons");
   list.replaceChildren(...(check.reasons || []).map((r) => el("li", { text: r })));
   document.getElementById("confirm-modal").classList.remove("hidden");
+  document.getElementById("modal-confirm").focus();
 }
 
 function closeConfirmModal() {
@@ -368,18 +473,71 @@ function closeConfirmModal() {
   document.getElementById("confirm-modal").classList.add("hidden");
 }
 
+function renderForecastResult(d) {
+  const box = document.getElementById("forecast-result");
+  const minVal = Math.min(d.low_price, d.latest_close) * 0.99;
+  const maxVal = Math.max(d.high_price, d.latest_close) * 1.01;
+  const span = maxVal - minVal || 1;
+  const pct = (v) => `${Math.max(0, Math.min(100, ((v - minVal) / span) * 100)).toFixed(1)}%`;
+
+  const band = el("div", { class: "gauge-band" });
+  band.style.left = pct(d.low_price);
+  band.style.width = `${Math.max(4, ((d.high_price - d.low_price) / span) * 100).toFixed(1)}%`;
+
+  const nowMark = el("div", { class: "gauge-marker gauge-marker-now", title: `現價 ${d.latest_close}` });
+  nowMark.style.left = pct(d.latest_close);
+
+  const expMark = el("div", { class: "gauge-marker gauge-marker-exp", title: `中位推估 ${d.expected_price}` });
+  expMark.style.left = pct(d.expected_price);
+
+  const riskCls = d.risk_level === "高" ? "tag-HEAVY_BUY" : (d.risk_level === "中" ? "tag-HOLD" : "tag-ADD");
+
+  box.replaceChildren(
+    el("div", { class: "panel-head", style: "margin-bottom: 0;" }, [
+      el("strong", { text: `${d.name} (${d.symbol}) · 現價 ${fmtMoney(d.latest_close)} 元` }),
+      el("span", { class: `tag ${riskCls}`, text: `波動風險：${d.risk_level}` }),
+    ]),
+    el("div", { class: "gauge-wrap" }, [
+      el("div", { class: "gauge-legend" }, [
+        el("span", { class: "mono", text: `低標 ${fmtMoney(d.low_price)}` }),
+        el("span", { class: "mono", text: `中位 ${fmtMoney(d.expected_price)}` }),
+        el("span", { class: "mono", text: `高標 ${fmtMoney(d.high_price)}` }),
+      ]),
+      el("div", { class: "gauge-bar" }, [band, nowMark, expMark]),
+      el("div", { class: "gauge-legend" }, [
+        el("span", { text: "灰標：目前股價" }),
+        el("span", { text: "藍標：情境預期中位" }),
+      ]),
+    ]),
+    el("div", { class: "forecast-range" }, [
+      el("div", {}, [el("span", { class: "muted-text", text: "保守低標" }), el("strong", { class: "mono", text: `${fmtMoney(d.low_price)} 元` })]),
+      el("div", {}, [el("span", { class: "muted-text", text: "中位推估" }), el("strong", { class: "mono", text: `${fmtMoney(d.expected_price)} (${d.expected_return_pct >= 0 ? "+" : ""}${d.expected_return_pct}%)` })]),
+      el("div", {}, [el("span", { class: "muted-text", text: "樂觀高標" }), el("strong", { class: "mono", text: `${fmtMoney(d.high_price)} 元` })]),
+    ]),
+    el("p", { class: "rationale-box", style: "margin-bottom: 0;", text: d.plain_explanation }),
+  );
+}
+
 function wireEvents() {
-  document.querySelectorAll(".tab-btn").forEach((btn) => {
+  const savedTheme = localStorage.getItem("stockmate-theme") || "light";
+  applyTheme(savedTheme);
+  document.getElementById("btn-theme-toggle").addEventListener("click", () => {
+    const cur = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    applyTheme(cur);
+  });
+
+  document.querySelectorAll(".nav-btn").forEach((btn) => {
     btn.addEventListener("click", () => switchTab(btn.dataset.tab));
   });
 
   document.getElementById("order-symbol").addEventListener("change", prefillPriceForSelected);
+  document.getElementById("side-buy-btn").addEventListener("click", () => setOrderSide("BUY"));
+  document.getElementById("side-sell-btn").addEventListener("click", () => setOrderSide("SELL"));
 
   document.getElementById("source-select").addEventListener("change", async (e) => {
-    const target = e.target.value;
     const res = await api("/api/source", {
       method: "POST",
-      body: JSON.stringify({ source: target }),
+      body: JSON.stringify({ source: e.target.value }),
     });
     if (res.ok) {
       renderOverview(res.data);
@@ -439,7 +597,14 @@ function wireEvents() {
     }
   });
 
+  const modal = document.getElementById("confirm-modal");
   document.getElementById("modal-cancel").addEventListener("click", closeConfirmModal);
+  modal.addEventListener("click", (ev) => {
+    if (ev.target === modal) closeConfirmModal();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && !modal.classList.contains("hidden")) closeConfirmModal();
+  });
 
   document.getElementById("modal-confirm").addEventListener("click", async () => {
     if (!state.pendingOrder) return;
@@ -489,31 +654,15 @@ function wireEvents() {
       }),
     });
 
-    const box = document.getElementById("forecast-result");
     if (!res.ok) {
-      box.replaceChildren(el("p", { class: "feedback-msg", text: `試算失敗：${res.data.error}` }));
+      document.getElementById("forecast-result").replaceChildren(
+        el("p", { class: "feedback-msg", text: `試算失敗：${res.data.error}` }),
+      );
       return;
     }
-    const d = res.data;
-    box.replaceChildren(
-      el("div", { class: "stock-meta" }, [
-        el("strong", { text: `${d.name} (${d.symbol}) · 現價 ${fmtMoney(d.latest_close)} 元` }),
-        el("span", { class: `badge badge-${d.risk_level === "高" ? "SELL" : d.risk_level === "中" ? "HOLD" : "HEAVY_BUY"}`, text: `波動風險：${d.risk_level}` }),
-      ]),
-      el("div", { class: "forecast-range" }, [
-        el("div", {}, [el("span", { class: "muted", text: "保守低標" }), el("strong", { text: `${fmtMoney(d.low_price)} 元` })]),
-        el("div", {}, [el("span", { class: "muted", text: "中位推估" }), el("strong", { text: `${fmtMoney(d.expected_price)} 元 (${d.expected_return_pct >= 0 ? "+" : ""}${d.expected_return_pct}%)` })]),
-        el("div", {}, [el("span", { class: "muted", text: "樂觀高標" }), el("strong", { text: `${fmtMoney(d.high_price)} 元` })]),
-      ]),
-      el("p", { class: "stock-reason", text: d.plain_explanation }),
-    );
+    renderForecastResult(res.data);
   });
 }
-
-document.addEventListener("DOMContentLoaded", async () => {
-  wireEvents();
-  await Promise.all([loadOverview(), loadSchedules(), loadRealityCheck(), loadClasses()]);
-});
 
 async function loadClasses() {
   const q = document.getElementById("class-search").value.trim();
@@ -524,9 +673,9 @@ async function loadClasses() {
   if (!res.ok) return;
 
   const d = res.data;
-  const sumEl = document.getElementById("classes-summary");
-  sumEl.textContent = d.categories.length
-    ? `共 ${Object.values(d.group_counts).reduce((a, b) => a + b, 0)} 個分類 · 收錄 ${d.unique_symbols} 檔不重複台股（${d.total_quote_rows} 筆分類報價）· 最後更新：${d.last_updated_at || "--"}`
+  const totalCats = Object.values(d.group_counts).reduce((a, b) => a + b, 0);
+  document.getElementById("classes-summary").textContent = d.categories.length
+    ? `共 ${totalCats} 個分類 · 收錄 ${d.unique_symbols} 檔不重複台股（${d.total_quote_rows} 筆）· 更新：${d.last_updated_at || "--"}`
     : "尚未同步台股全類別資料，請點擊右側「立即同步全類別」。";
 
   const exportLink = document.getElementById("btn-export-csv");
@@ -535,10 +684,8 @@ async function loadClasses() {
   else if (state.selectedCategoryKey) expParams.set("category_key", state.selectedCategoryKey);
   exportLink.href = `/api/classes/export.csv?${expParams.toString()}`;
 
-  // 分組篩選鈕
   const groups = ["", "上市", "上櫃", "興櫃", "概念股", "集團股", "電子產業"];
-  const pillsEl = document.getElementById("class-group-pills");
-  pillsEl.replaceChildren(
+  document.getElementById("class-group-pills").replaceChildren(
     ...groups.map((g) => {
       const label = g ? `${g} (${d.group_counts[g] || 0})` : "全部";
       return el("button", {
@@ -554,10 +701,9 @@ async function loadClasses() {
     }),
   );
 
-  // 分類清單
   const listEl = document.getElementById("class-list");
   if (!d.categories.length) {
-    listEl.replaceChildren(el("p", { class: "muted", text: "目前無符合條件的分類。" }));
+    listEl.replaceChildren(el("p", { class: "muted-text", text: "目前無符合條件的分類。" }));
     document.getElementById("class-quotes-body").replaceChildren();
     return;
   }
@@ -582,8 +728,8 @@ async function loadClasses() {
           el("div", { class: "class-item-meta", text: `${c.group_type} · ${c.stock_count} 檔 (漲${c.up_count}/跌${c.down_count})` }),
         ]),
         el("span", {
-          class: (c.avg_change_pct || 0) >= 0 ? "pos" : "neg",
-          style: "font-weight: 700; font-size: 0.85rem;",
+          class: `mono ${(c.avg_change_pct || 0) >= 0 ? "pos" : "neg"}`,
+          style: "font-weight: 600; font-size: 0.82rem;",
           text: avgText,
         }),
       ]);
@@ -605,7 +751,7 @@ async function loadCategoryQuotes(categoryKey) {
 
   const body = document.getElementById("class-quotes-body");
   if (!quotes.length) {
-    body.replaceChildren(el("tr", {}, [el("td", { colspan: "6", class: "muted", text: "尚無成分股報價資料。" })]));
+    body.replaceChildren(el("tr", {}, [el("td", { colspan: "6", class: "muted-text", text: "尚無成分股報價資料。" })]));
     return;
   }
 
@@ -616,21 +762,24 @@ async function loadCategoryQuotes(categoryKey) {
         ? `${item.change >= 0 ? "+" : ""}${item.change} (${item.change_pct >= 0 ? "+" : ""}${item.change_pct}%)`
         : "--";
       const lots = Math.round((item.volume || 0) / 1000);
-      const limitTag = item.limit_up ? " [漲停]" : (item.limit_down ? " [跌停]" : "");
 
       return el("tr", {}, [
         el("td", {}, [
-          el("strong", { text: item.symbol_name }),
-          el("div", { class: "stock-code", text: `${item.symbol}${limitTag}` }),
+          el("div", { style: "display: flex; align-items: center; gap: 6px;" }, [
+            el("strong", { text: item.symbol_name }),
+            item.limit_up ? el("span", { class: "tag tag-HEAVY_BUY", text: "漲停" }) : null,
+            item.limit_down ? el("span", { class: "tag tag-SELL", text: "跌停" }) : null,
+          ]),
+          el("div", { class: "mono muted-text", style: "font-size: 0.74rem;", text: item.symbol }),
         ]),
-        el("td", { class: chgCls, style: "font-weight: 700;", text: item.price !== null ? `${fmtMoney(item.price)}` : "--" }),
-        el("td", { class: chgCls, text: chgText }),
-        el("td", { text: `${item.open ?? "--"} / ${item.high ?? "--"} / ${item.low ?? "--"} / ${item.prev_close ?? "--"}` }),
-        el("td", { text: `${fmtMoney(lots)} 張 / ${item.turnover_m ?? "--"} M` }),
+        el("td", { class: `num ${chgCls}`, style: "font-weight: 600;", text: item.price !== null ? `${fmtMoney(item.price)}` : "--" }),
+        el("td", { class: `num ${chgCls}`, text: chgText }),
+        el("td", { class: "num", text: `${item.open ?? "--"} / ${item.high ?? "--"} / ${item.low ?? "--"} / ${item.prev_close ?? "--"}` }),
+        el("td", { class: "num", text: `${fmtMoney(lots)} 張 / ${item.turnover_m ?? "--"} M` }),
         el("td", {}, [
           item.price ? el("button", {
             type: "button",
-            class: "btn btn-outline btn-sm",
+            class: "btn btn-ghost btn-sm",
             text: "帶入下單",
             onclick: () => {
               const sel = document.getElementById("order-symbol");
@@ -638,13 +787,13 @@ async function loadCategoryQuotes(categoryKey) {
                 sel.appendChild(el("option", { value: item.symbol, text: `${item.symbol_name} (${item.symbol}) · ${item.price} 元` }));
               }
               sel.value = item.symbol;
-              document.getElementById("order-side").value = "BUY";
+              setOrderSide("BUY");
               document.getElementById("order-price").value = item.price;
               document.getElementById("order-sl").value = (item.price * 0.95).toFixed(2);
               document.getElementById("order-tp").value = (item.price * 1.1).toFixed(2);
               switchTab("tab-trade");
             },
-          }) : el("span", { class: "muted", text: "--" }),
+          }) : el("span", { class: "muted-text", text: "--" }),
         ]),
       ]);
     }),
@@ -653,16 +802,24 @@ async function loadCategoryQuotes(categoryKey) {
 
 function startSyncPolling() {
   if (state.syncTimer) return;
+  const track = document.getElementById("classes-sync-progress");
+  const bar = document.getElementById("classes-sync-bar");
+  track.classList.remove("hidden");
+
   state.syncTimer = setInterval(async () => {
     const res = await api("/api/classes/sync-status");
     if (!res.ok) return;
     const s = res.data;
     const msgEl = document.getElementById("classes-sync-msg");
     if (s.running) {
+      const pct = s.total_categories ? Math.round((s.synced_categories / s.total_categories) * 100) : 10;
+      bar.style.width = `${pct}%`;
       msgEl.textContent = `同步進行中：${s.synced_categories} / ${s.total_categories || "?"} 類別（已寫入 ${s.total_quote_rows} 筆報價）...`;
     } else {
       clearInterval(state.syncTimer);
       state.syncTimer = null;
+      bar.style.width = "100%";
+      setTimeout(() => track.classList.add("hidden"), 400);
       msgEl.textContent = s.last_error
         ? `同步完成（部分異常）：${s.synced_categories} 類別、${s.total_quote_rows} 筆，錯誤：${s.last_error}`
         : `同步完成：共 ${s.synced_categories} 類別、${s.total_quote_rows} 筆報價（${s.last_finished_at || ""}）`;
@@ -670,3 +827,8 @@ function startSyncPolling() {
     }
   }, 1500);
 }
+
+document.addEventListener("DOMContentLoaded", async () => {
+  wireEvents();
+  await Promise.all([loadOverview(), loadSchedules(), loadRealityCheck(), loadClasses()]);
+});
