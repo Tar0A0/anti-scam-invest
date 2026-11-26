@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import re
 import sys
 import threading
@@ -13,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
 from app.adapters.mock import DEFAULT_WATCHLIST, MockMarketAdapter
@@ -30,7 +31,7 @@ from app.core.strategy import (
     simulate_conditional_forecast,
 )
 from app.core.validator import save_validated_quotes, validate_quotes
-from app.db.database import get_connection, init_db
+from app.db.database import db_health_check, get_connection, init_db
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "stockmate.db"
@@ -46,6 +47,18 @@ STATIC_FILES: dict[str, tuple[str, str]] = {
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
 }
+
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitize_csv_cell(value: Any) -> Any:
+    """防範 CSV 公式注入：字串若以 =, +, -, @ 等字元開頭則安全前綴單引號，數值欄位保留原樣。"""
+    if not isinstance(value, str) or not value:
+        return value
+    stripped = value.lstrip(" \t\r")
+    if value[0] in _CSV_FORMULA_PREFIXES or (stripped and stripped[0] in ("=", "+", "-", "@")):
+        return f"'{value}"
+    return value
 
 
 class AppService:
@@ -760,10 +773,23 @@ class AppService:
                 ])
                 for r in rows:
                     writer.writerow([
-                        r["group_type"], r["category_name"], r["symbol"], r["symbol_name"],
-                        r["exchange"], r["price"], r["change"], r["change_pct"],
-                        r["open"], r["high"], r["low"], r["prev_close"],
-                        r["volume"], r["turnover_m"], r["limit_up"], r["limit_down"], r["quote_time"],
+                        _sanitize_csv_cell(r["group_type"]),
+                        _sanitize_csv_cell(r["category_name"]),
+                        _sanitize_csv_cell(r["symbol"]),
+                        _sanitize_csv_cell(r["symbol_name"]),
+                        _sanitize_csv_cell(r["exchange"]),
+                        _sanitize_csv_cell(r["price"]),
+                        _sanitize_csv_cell(r["change"]),
+                        _sanitize_csv_cell(r["change_pct"]),
+                        _sanitize_csv_cell(r["open"]),
+                        _sanitize_csv_cell(r["high"]),
+                        _sanitize_csv_cell(r["low"]),
+                        _sanitize_csv_cell(r["prev_close"]),
+                        _sanitize_csv_cell(r["volume"]),
+                        _sanitize_csv_cell(r["turnover_m"]),
+                        _sanitize_csv_cell(r["limit_up"]),
+                        _sanitize_csv_cell(r["limit_down"]),
+                        _sanitize_csv_cell(r["quote_time"]),
                     ])
                 return buf.getvalue().encode("utf-8-sig")
             finally:
@@ -782,6 +808,26 @@ class AppService:
         overview = self.get_overview()
         return len(overview["stocks"])
 
+    def get_health(self) -> dict[str, Any]:
+        """回傳系統健康狀態：資料庫健康度、目前資料源、live updater 狀態與排程總數。"""
+        db_health = db_health_check(self.db_path)
+        live_state = self.get_live_state()
+        live_running = bool(self._live_thread is not None and self._live_thread.is_alive())
+        schedule_count = int(db_health.get("table_counts", {}).get("schedule_configs", 0))
+        return {
+            "status": "ok" if db_health.get("ok") else "degraded",
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "active_source": self.active_source,
+            "source_label": SOURCE_LABELS.get(self.active_source, self.active_source),
+            "database": db_health,
+            "live_updater": {
+                **live_state,
+                "running": live_running,
+            },
+            "schedule_count": schedule_count,
+            "registered_jobs": len(self.scheduler._jobs),
+        }
+
     def get_overview(self) -> dict[str, Any]:
         with self._lock:
             conn = get_connection(self.db_path)
@@ -792,7 +838,7 @@ class AppService:
                 for symbol, name in watchlist.items():
                     rows = conn.execute(
                         """
-                        SELECT quote_time, close, volume
+                        SELECT quote_time, open, high, low, close, volume
                         FROM market_quotes
                         WHERE symbol = ? AND source = ?
                         ORDER BY quote_time ASC;
@@ -800,7 +846,8 @@ class AppService:
                         (symbol, source),
                     ).fetchall()
                     if rows:
-                        stocks.append(analyze_quotes(symbol, name, rows))
+                        # 完整透傳 analyze_quotes 回傳的所有指標與診斷欄位
+                        stocks.append(dict(analyze_quotes(symbol, name, rows)))
 
                 max_row = conn.execute(
                     "SELECT MAX(quote_time) AS max_t FROM market_quotes WHERE source = ?;",
@@ -855,7 +902,7 @@ class AppService:
             try:
                 rows = conn.execute(
                     """
-                    SELECT quote_time, close, volume
+                    SELECT quote_time, open, high, low, close, volume
                     FROM market_quotes
                     WHERE symbol = ? AND source = ?
                     ORDER BY quote_time ASC;
@@ -898,6 +945,8 @@ def _parse_order_request(payload: dict[str, Any]) -> tuple[OrderRequest, float |
     raw_tp = payload.get("take_profit_price")
     sl = float(raw_sl) if raw_sl not in (None, "") else None
     tp = float(raw_tp) if raw_tp not in (None, "") else None
+    if not math.isfinite(price) or (sl is not None and not math.isfinite(sl)) or (tp is not None and not math.isfinite(tp)):
+        raise ValueError("價格、停損價與停利價須為有限數值")
     confirmed = bool(payload.get("confirmed_by_user", False))
     return OrderRequest(symbol=symbol, side=side, quantity=quantity, price=price, stop_loss_price=sl, confirmed_by_user=confirmed), tp
 
@@ -933,6 +982,23 @@ def create_server(
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             return
 
+        def end_headers(self) -> None:
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            super().end_headers()
+
+        def _safe_dispatch(self, handler_fn: Callable[[], None]) -> None:
+            try:
+                handler_fn()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception:  # noqa: BLE001 - 頂層例外防護，不洩漏內部 traceback 給前端
+                try:
+                    self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "伺服器內部錯誤，請稍後再試"})
+                except OSError:
+                    return
+
         def _send_json(self, status: int, data: Any) -> None:
             body = json.dumps(data, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
@@ -953,9 +1019,17 @@ def create_server(
             return parsed
 
         def do_GET(self) -> None:  # noqa: N802
+            self._safe_dispatch(self._handle_get)
+
+        def _handle_get(self) -> None:
             parsed_url = urlparse(self.path)
             path = parsed_url.path
             query = parse_qs(parsed_url.query)
+
+            if path == "/favicon.ico":
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.end_headers()
+                return
 
             if path in STATIC_FILES:
                 filename, ctype = STATIC_FILES[path]
@@ -971,6 +1045,11 @@ def create_server(
                 self.wfile.write(content)
                 return
 
+            if path == "/api/health":
+                health = service.get_health()
+                status = HTTPStatus.OK if health.get("status") == "ok" else HTTPStatus.SERVICE_UNAVAILABLE
+                self._send_json(status, health)
+                return
             if path == "/api/stocks/search":
                 q = (query.get("q") or [""])[0].strip()
                 self._send_json(HTTPStatus.OK, {"items": service.search_stocks(q)})
@@ -1019,6 +1098,9 @@ def create_server(
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "找不到指定路徑"})
 
         def do_PUT(self) -> None:  # noqa: N802
+            self._safe_dispatch(self._handle_put)
+
+        def _handle_put(self) -> None:
             path = urlparse(self.path).path
             prefix = "/api/schedules/"
             if not path.startswith(prefix):
@@ -1041,6 +1123,9 @@ def create_server(
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
         def do_POST(self) -> None:  # noqa: N802
+            self._safe_dispatch(self._handle_post)
+
+        def _handle_post(self) -> None:
             path = urlparse(self.path).path
 
             if path == "/api/watchlist":
@@ -1075,7 +1160,7 @@ def create_server(
                     body = self._read_json()
                     overview = service.switch_source(str(body.get("source", "")).strip())
                     self._send_json(HTTPStatus.OK, overview)
-                except ValueError as exc:
+                except (ValueError, TypeError, json.JSONDecodeError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 except RuntimeError as exc:
                     self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
@@ -1100,7 +1185,7 @@ def create_server(
                         finally:
                             conn.close()
                     self._send_json(HTTPStatus.OK, asdict(check))
-                except (ValueError, json.JSONDecodeError) as exc:
+                except (ValueError, TypeError, json.JSONDecodeError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
 
@@ -1119,7 +1204,7 @@ def create_server(
                     if ok:
                         service.bump_data_version()
                     self._send_json(status, {"ok": ok, "check": asdict(check), "order": order_info})
-                except (ValueError, json.JSONDecodeError) as exc:
+                except (ValueError, TypeError, json.JSONDecodeError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
 
@@ -1138,10 +1223,14 @@ def create_server(
             if path == "/api/forecast/simulate":
                 try:
                     body = self._read_json()
+                    mkt = float(body.get("market_change_pct", 0.0))
+                    vol_m = float(body.get("volume_multiplier", 1.0))
+                    if not (math.isfinite(mkt) and math.isfinite(vol_m)):
+                        raise ValueError("模擬參數必須為有限數值")
                     res = service.simulate_forecast(
                         str(body.get("symbol", "")).strip(),
-                        market_change_pct=float(body.get("market_change_pct", 0.0)),
-                        volume_multiplier=float(body.get("volume_multiplier", 1.0)),
+                        market_change_pct=mkt,
+                        volume_multiplier=vol_m,
                         news_sentiment=str(body.get("news_sentiment", "neutral")),
                     )
                     self._send_json(HTTPStatus.OK, res)
@@ -1154,6 +1243,9 @@ def create_server(
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "找不到指定路徑"})
 
         def do_DELETE(self) -> None:  # noqa: N802
+            self._safe_dispatch(self._handle_delete)
+
+        def _handle_delete(self) -> None:
             path = urlparse(self.path).path
             prefix = "/api/watchlist/"
             if not path.startswith(prefix):

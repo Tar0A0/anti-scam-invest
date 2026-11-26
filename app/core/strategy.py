@@ -19,6 +19,102 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def _extract_optional_positive_float(row: sqlite3.Row | dict[str, Any], key: str) -> float | None:
+    if isinstance(row, dict):
+        val = row.get(key)
+    else:
+        val = row[key] if key in row.keys() else None
+    if val is None:
+        return None
+    try:
+        num = float(val)
+        return num if num > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _compute_rsi14(closes: list[float]) -> float:
+    """計算 14 日 Wilder RSI（樣本不足時以可用天數計算，範圍 0~100）。"""
+    if len(closes) < 2:
+        return 50.0
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    period = min(14, len(deltas))
+    avg_gain = sum(max(d, 0.0) for d in deltas[:period]) / period
+    avg_loss = sum(max(-d, 0.0) for d in deltas[:period]) / period
+    for delta in deltas[period:]:
+        gain = max(delta, 0.0)
+        loss = max(-delta, 0.0)
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+
+    if avg_gain == 0.0 and avg_loss == 0.0:
+        return 50.0
+    if avg_loss == 0.0:
+        return 100.0
+    if avg_gain == 0.0:
+        return 0.0
+    rs = avg_gain / avg_loss
+    return _clamp(100.0 - (100.0 / (1.0 + rs)), 0.0, 100.0)
+
+
+def _classify_rsi(rsi14: float) -> str:
+    """將 RSI 數值轉譯為新手易懂的白話體溫標籤。"""
+    if rsi14 > 70.0:
+        return "過熱(>70)"
+    if rsi14 >= 55.0:
+        return "偏強(55~70)"
+    if rsi14 >= 45.0:
+        return "中性(45~55)"
+    if rsi14 >= 30.0:
+        return "偏弱(30~45)"
+    return "超賣(<30)"
+
+
+def _compute_atr14_pct(
+    quotes: list[sqlite3.Row | dict[str, Any]],
+    closes: list[float],
+    latest_close: float,
+) -> float:
+    """計算近 14 日平均真實／收盤振幅百分比（%），衡量個股日常波動度。"""
+    if latest_close <= 0 or not closes:
+        return 0.0
+    true_ranges: list[float] = []
+    for i, q in enumerate(quotes):
+        high = _extract_optional_positive_float(q, "high")
+        low = _extract_optional_positive_float(q, "low")
+        if high is not None and low is not None and high >= low:
+            if i > 0:
+                prev_c = closes[i - 1]
+                tr = max(high - low, abs(high - prev_c), abs(low - prev_c))
+            else:
+                tr = high - low
+            true_ranges.append(tr)
+        elif i > 0:
+            true_ranges.append(abs(closes[i] - closes[i - 1]))
+    if not true_ranges:
+        return 0.0
+    window = true_ranges[-14:]
+    atr14 = sum(window) / len(window)
+    return max(0.0, atr14 / latest_close * 100.0)
+
+
+def _compute_support_resistance(
+    quotes: list[sqlite3.Row | dict[str, Any]],
+    closes: list[float],
+) -> tuple[float, float]:
+    """計算近 20 日支撐與壓力參考價（有高低價優先參考高低點，否則以收盤價區間估算）。"""
+    recent_quotes = quotes[-20:]
+    recent_closes = closes[-20:]
+    lows: list[float] = []
+    highs: list[float] = []
+    for q, c in zip(recent_quotes, recent_closes):
+        low = _extract_optional_positive_float(q, "low")
+        high = _extract_optional_positive_float(q, "high")
+        lows.append(min(low, c) if low is not None else c)
+        highs.append(max(high, c) if high is not None else c)
+    return min(lows), max(highs)
+
+
 def analyze_quotes(symbol: str, display_name: str, quotes: list[sqlite3.Row | dict[str, Any]]) -> dict[str, Any]:
     """將原始 K 線轉為新手看得懂的健康度評分（0~100）與四選一操作建議。"""
     if not quotes:
@@ -45,7 +141,37 @@ def analyze_quotes(symbol: str, display_name: str, quotes: list[sqlite3.Row | di
     else:
         win_rate_nd = 50.0
 
-    # 計算健康度評分（基礎 50 分，依均線、乖離與勝率加減）
+    # 進階量化指標：14 日 RSI、14 日波動率、近 20 日支撐／壓力、建議停損／停利價
+    rsi14 = round(_compute_rsi14(closes), 2)
+    rsi_label = _classify_rsi(rsi14)
+    atr14_pct = round(_compute_atr14_pct(quotes, closes, latest_close), 2)
+    raw_support, raw_resistance = _compute_support_resistance(quotes, closes)
+    support_price = round(raw_support, 2)
+    resistance_price = round(raw_resistance, 2)
+
+    latest_close_rounded = round(latest_close, 2)
+    vol_pct = max(atr14_pct, 1.5)
+    stop_dist_pct = _clamp(vol_pct * 2.0, 3.0, 10.0)
+    atr_stop = latest_close * (1.0 - stop_dist_pct / 100.0)
+    support_stop = raw_support * 0.99
+    candidate_stop = min(atr_stop, support_stop) if support_stop >= latest_close * 0.88 else atr_stop
+    raw_stop = _clamp(candidate_stop, latest_close * 0.88, latest_close * 0.97)
+    suggested_stop_loss = round(raw_stop, 2)
+    if suggested_stop_loss >= latest_close_rounded:
+        suggested_stop_loss = round(max(0.01, latest_close_rounded - 0.01), 2)
+
+    risk_amount = max(latest_close - suggested_stop_loss, latest_close * 0.03)
+    rr_target = latest_close + risk_amount * 1.8
+    if latest_close * 1.04 <= raw_resistance <= latest_close * 1.25:
+        raw_tp = max(rr_target, raw_resistance)
+    else:
+        raw_tp = rr_target
+    raw_tp = _clamp(raw_tp, latest_close * 1.04, latest_close * 1.30)
+    suggested_take_profit = round(raw_tp, 2)
+    if suggested_take_profit <= latest_close_rounded:
+        suggested_take_profit = round(latest_close_rounded + 0.01, 2)
+
+    # 計算健康度評分（基礎 50 分，依均線、乖離、勝率、RSI 與支撐壓力加減）
     score = 50.0
     if latest_close >= ma20:
         score += 18.0
@@ -60,6 +186,21 @@ def analyze_quotes(symbol: str, display_name: str, quotes: list[sqlite3.Row | di
     elif bias_pct > 8.0 or bias_pct < -8.0:
         score -= 10.0
     score += (win_rate_nd - 50.0) * 0.25
+
+    if rsi14 > 70.0:
+        score -= 6.0
+    elif rsi14 >= 55.0:
+        score += 4.0
+    elif rsi14 < 30.0:
+        score -= 4.0
+
+    dist_support_pct = ((latest_close - raw_support) / latest_close * 100.0) if latest_close > 0 else 0.0
+    dist_resistance_pct = ((raw_resistance - latest_close) / latest_close * 100.0) if latest_close > 0 else 0.0
+    if latest_close >= ma20 and dist_support_pct <= 3.0:
+        score += 3.0
+    if dist_resistance_pct <= 1.5 and rsi14 > 65.0:
+        score -= 3.0
+
     health_score = int(round(_clamp(score, 0.0, 100.0)))
 
     # 決定四選一白話策略建議
@@ -104,16 +245,40 @@ def analyze_quotes(symbol: str, display_name: str, quotes: list[sqlite3.Row | di
             f"{volume_ratio:.1f} 倍），先繼續蹲著觀察，別急著亂動。"
         )
 
+    if rsi14 > 70.0:
+        quant_note = (
+            f" 目前 RSI 達 {rsi14:.1f}（過熱），短線追高風險偏大，"
+            f"參考壓力價 {resistance_price:,.2f} 元、防守支撐 {support_price:,.2f} 元。"
+        )
+    elif rsi14 < 30.0:
+        quant_note = (
+            f" 目前 RSI 僅 {rsi14:.1f}（超賣），雖有機會醞釀短線反彈但趨勢仍弱，"
+            f"先觀察近 20 日支撐 {support_price:,.2f} 元是否守穩。"
+        )
+    else:
+        quant_note = (
+            f" 目前 RSI 為 {rsi14:.1f}（{rsi_label}），"
+            f"近 20 日參考支撐 {support_price:,.2f} 元、壓力 {resistance_price:,.2f} 元。"
+        )
+    plain_reason = f"{plain_reason}{quant_note}"
+
     return {
         "symbol": symbol,
         "name": display_name,
-        "latest_close": round(latest_close, 2),
+        "latest_close": latest_close_rounded,
         "change_pct": round(change_pct, 2),
         "ma5": round(ma5, 2),
         "ma20": round(ma20, 2),
         "bias_pct": round(bias_pct, 2),
         "volume_ratio": round(volume_ratio, 2),
         "win_rate_nd": round(win_rate_nd, 1),
+        "rsi14": rsi14,
+        "rsi_label": rsi_label,
+        "atr14_pct": atr14_pct,
+        "support_price": support_price,
+        "resistance_price": resistance_price,
+        "suggested_stop_loss": suggested_stop_loss,
+        "suggested_take_profit": suggested_take_profit,
         "health_score": health_score,
         "action": action,
         "action_label": ACTION_LABELS[action],
@@ -138,7 +303,7 @@ def run_strategy_and_save(
             if source:
                 rows = conn.execute(
                     """
-                    SELECT quote_time, close, volume
+                    SELECT quote_time, high, low, close, volume
                     FROM market_quotes
                     WHERE symbol = ? AND source = ?
                     ORDER BY quote_time ASC;
@@ -148,7 +313,7 @@ def run_strategy_and_save(
             else:
                 rows = conn.execute(
                     """
-                    SELECT quote_time, close, volume
+                    SELECT quote_time, high, low, close, volume
                     FROM market_quotes
                     WHERE symbol = ?
                     ORDER BY quote_time ASC;

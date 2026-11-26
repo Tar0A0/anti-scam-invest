@@ -106,6 +106,8 @@ class TaskScheduler:
         self._loop_stop = threading.Event()
         self._loop_thread: threading.Thread | None = None
         self._last_fired_minute: dict[str, str] = {}
+        self._running_jobs: set[str] = set()
+        self._running_lock = threading.Lock()
 
     def register_job(
         self,
@@ -180,60 +182,19 @@ class TaskScheduler:
         finally:
             conn.close()
 
-    def run_job(
+    def _write_job_log(
         self,
-        job_name: str,
-        trigger_type: str = "scheduled",
         *,
-        retry_delay_sec: float = 0.0,
-    ) -> JobRunResult:
-        """執行指定任務，支援自動重試並將執行結果寫入 job_logs。"""
-        if job_name not in self._jobs:
-            raise KeyError(f"任務尚未註冊：{job_name}")
-        if trigger_type not in ("scheduled", "manual"):
-            raise ValueError("trigger_type 必須為 'scheduled' 或 'manual'")
-
-        conn = get_connection(self.db_path)
-        try:
-            row = conn.execute(
-                "SELECT max_retries FROM schedule_configs WHERE job_name = ?;",
-                (job_name,),
-            ).fetchone()
-            max_retries = int(row["max_retries"]) if row else 0
-        finally:
-            conn.close()
-
-        started_at = _utc_now_iso()
-        t0 = time.perf_counter()
-        retry_count = 0
-        status = "FAILED"
-        records_processed = 0
-        error_message: str | None = None
-
-        for attempt in range(max_retries + 1):
-            try:
-                raw_result = self._jobs[job_name]()
-                if isinstance(raw_result, tuple):
-                    status, records_processed, error_message = raw_result
-                    if status not in ("SUCCESS", "FAILED", "PARTIAL"):
-                        raise ValueError(f"無效的任務回傳狀態：{status}")
-                else:
-                    status = "SUCCESS"
-                    records_processed = int(raw_result)
-                    error_message = None
-                break
-            except Exception as exc:  # noqa: BLE001 - 捕捉任務執行期任何異常以記錄日誌與重試
-                error_message = f"{type(exc).__name__}: {exc}"
-                if attempt < max_retries:
-                    retry_count += 1
-                    if retry_delay_sec > 0:
-                        time.sleep(retry_delay_sec)
-                else:
-                    status = "FAILED"
-
-        duration_ms = max(0, int((time.perf_counter() - t0) * 1000))
-        finished_at = _utc_now_iso()
-
+        job_name: str,
+        trigger_type: str,
+        started_at: str,
+        finished_at: str,
+        duration_ms: int,
+        status: str,
+        retry_count: int,
+        records_processed: int,
+        error_message: str | None,
+    ) -> None:
         conn = get_connection(self.db_path)
         try:
             with conn:
@@ -259,15 +220,111 @@ class TaskScheduler:
         finally:
             conn.close()
 
-        return JobRunResult(
-            job_name=job_name,
-            trigger_type=trigger_type,
-            status=status,
-            retry_count=retry_count,
-            records_processed=records_processed,
-            duration_ms=duration_ms,
-            error_message=error_message,
-        )
+    def run_job(
+        self,
+        job_name: str,
+        trigger_type: str = "scheduled",
+        *,
+        retry_delay_sec: float = 0.0,
+    ) -> JobRunResult:
+        """執行指定任務，支援防重入保護、自動重試並將執行結果寫入 job_logs。"""
+        if job_name not in self._jobs:
+            raise KeyError(f"任務尚未註冊：{job_name}")
+        if trigger_type not in ("scheduled", "manual"):
+            raise ValueError("trigger_type 必須為 'scheduled' 或 'manual'")
+
+        with self._running_lock:
+            if job_name in self._running_jobs:
+                now_iso = _utc_now_iso()
+                skip_msg = f"任務 {job_name} 正在執行中，已略過重複觸發"
+                self._write_job_log(
+                    job_name=job_name,
+                    trigger_type=trigger_type,
+                    started_at=now_iso,
+                    finished_at=now_iso,
+                    duration_ms=0,
+                    status="PARTIAL",
+                    retry_count=0,
+                    records_processed=0,
+                    error_message=skip_msg,
+                )
+                return JobRunResult(
+                    job_name=job_name,
+                    trigger_type=trigger_type,
+                    status="PARTIAL",
+                    retry_count=0,
+                    records_processed=0,
+                    duration_ms=0,
+                    error_message=skip_msg,
+                )
+            self._running_jobs.add(job_name)
+
+        try:
+            conn = get_connection(self.db_path)
+            try:
+                row = conn.execute(
+                    "SELECT max_retries FROM schedule_configs WHERE job_name = ?;",
+                    (job_name,),
+                ).fetchone()
+                max_retries = int(row["max_retries"]) if row else 0
+            finally:
+                conn.close()
+
+            started_at = _utc_now_iso()
+            t0 = time.perf_counter()
+            retry_count = 0
+            status = "FAILED"
+            records_processed = 0
+            error_message: str | None = None
+
+            for attempt in range(max_retries + 1):
+                try:
+                    raw_result = self._jobs[job_name]()
+                    if isinstance(raw_result, tuple):
+                        status, records_processed, error_message = raw_result
+                        if status not in ("SUCCESS", "FAILED", "PARTIAL"):
+                            raise ValueError(f"無效的任務回傳狀態：{status}")
+                    else:
+                        status = "SUCCESS"
+                        records_processed = int(raw_result)
+                        error_message = None
+                    break
+                except Exception as exc:  # noqa: BLE001 - 捕捉任務執行期任何異常以記錄日誌與重試
+                    error_message = f"{type(exc).__name__}: {exc}"
+                    if attempt < max_retries:
+                        retry_count += 1
+                        if retry_delay_sec > 0:
+                            time.sleep(retry_delay_sec)
+                    else:
+                        status = "FAILED"
+
+            duration_ms = max(0, int((time.perf_counter() - t0) * 1000))
+            finished_at = _utc_now_iso()
+
+            self._write_job_log(
+                job_name=job_name,
+                trigger_type=trigger_type,
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+                status=status,
+                retry_count=retry_count,
+                records_processed=records_processed,
+                error_message=error_message,
+            )
+
+            return JobRunResult(
+                job_name=job_name,
+                trigger_type=trigger_type,
+                status=status,
+                retry_count=retry_count,
+                records_processed=records_processed,
+                duration_ms=duration_ms,
+                error_message=error_message,
+            )
+        finally:
+            with self._running_lock:
+                self._running_jobs.discard(job_name)
 
     def rerun_job(self, job_name: str) -> JobRunResult:
         """提供給儀表板的「一鍵手動重跑」入口。"""
@@ -357,6 +414,9 @@ class TaskScheduler:
                         if self._last_fired_minute.get(job_name) == minute_key:
                             continue
                         if cron_matches(cfg["cron_expr"], now_tpe):
+                            with self._running_lock:
+                                if job_name in self._running_jobs:
+                                    continue
                             self._last_fired_minute[job_name] = minute_key
                             threading.Thread(
                                 target=self.run_job,

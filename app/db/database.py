@@ -4,8 +4,22 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+
+CORE_TABLES: tuple[str, ...] = (
+    "market_quotes",
+    "watchlist",
+    "schedule_configs",
+    "job_logs",
+    "strategy_signals",
+    "positions",
+    "orders",
+    "risk_lockouts",
+    "yahoo_categories",
+    "yahoo_category_quotes",
+)
 
 # 預設排程種子資料：對應「盤前、盤中、盤後、策略分析、白話日報」五個日常任務
 DEFAULT_SCHEDULES = (
@@ -27,12 +41,71 @@ DEFAULT_WATCHLIST_SEEDS = (
 
 
 def get_connection(db_path: str | Path) -> sqlite3.Connection:
-    """建立啟用 WAL 模式與外鍵約束的 SQLite 連線。"""
-    conn = sqlite3.connect(str(db_path))
+    """建立啟用 WAL 模式、busy_timeout 與外鍵約束的 SQLite 連線。"""
+    conn = sqlite3.connect(str(db_path), timeout=5.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
+
+
+def db_health_check(db_path: str | Path) -> dict[str, Any]:
+    """檢查 SQLite 資料庫連線健康度、檔案大小與各核心資料表筆數。"""
+    path = Path(db_path)
+    if not path.exists():
+        return {
+            "ok": False,
+            "db_path": str(path),
+            "exists": False,
+            "file_size_bytes": 0,
+            "journal_mode": None,
+            "table_counts": {},
+            "error": "資料庫檔案不存在",
+        }
+
+    file_size = path.stat().st_size
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = get_connection(path)
+        conn.execute("SELECT 1;").fetchone()
+        jm_row = conn.execute("PRAGMA journal_mode;").fetchone()
+        journal_mode = str(jm_row[0]) if jm_row else None
+
+        existing_tables = {
+            str(r["name"])
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table';").fetchall()
+        }
+        table_counts: dict[str, int] = {}
+        for table in CORE_TABLES:
+            if table in existing_tables:
+                row = conn.execute(f"SELECT COUNT(*) AS cnt FROM {table};").fetchone()
+                table_counts[table] = int(row["cnt"]) if row else 0
+            else:
+                table_counts[table] = 0
+
+        return {
+            "ok": True,
+            "db_path": str(path),
+            "exists": True,
+            "file_size_bytes": file_size,
+            "journal_mode": journal_mode,
+            "table_counts": table_counts,
+            "error": None,
+        }
+    except Exception as exc:  # noqa: BLE001 - 健康檢查必須安全回傳錯誤摘要
+        return {
+            "ok": False,
+            "db_path": str(path),
+            "exists": path.exists(),
+            "file_size_bytes": file_size,
+            "journal_mode": None,
+            "table_counts": {},
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def init_db(db_path: str | Path) -> None:

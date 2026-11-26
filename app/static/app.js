@@ -2,6 +2,7 @@
 
 const state = {
   stocks: [],
+  portfolio: null,
   selectedSymbol: null,
   pendingOrder: null,
   classGroup: "",
@@ -14,6 +15,186 @@ const state = {
 };
 
 const fmtMoney = (n) => Number(n).toLocaleString("zh-TW", { maximumFractionDigits: 2 });
+const isFiniteNum = (v) => v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v));
+const GUIDE_STORAGE_KEY = "stockmate-guide-dismissed";
+
+const GLOSSARY_TERMS = [
+  {
+    key: "ma20",
+    title: "月線 (MA20)",
+    code: "MA20",
+    metaphor: "生活比喻：過去一個月買進這檔股票的「大家平均成本線」。",
+    desc: "把最近 20 個交易日的收盤價加起來平均。股價站在月線上方，代表近一個月買的人多數賺錢、籌碼相對安定；跌破月線則代表近期進場者開始虧損，容易遇到解套賣壓。",
+    tip: "新手口訣：先看股價在月線之上還是之下，順著大方向比較省力。",
+  },
+  {
+    key: "bias",
+    title: "乖離率 (Bias)",
+    code: "BIAS %",
+    metaphor: "生活比喻：股價與月線之間的「橡皮筋拉扯程度」。",
+    desc: "衡量目前股價離月線有多遠。正乖離太大（例如超過 +8%），代表短線漲太急、像橡皮筋拉太緊隨時可能回彈修正；負乖離過大則代表短線急跌。",
+    tip: "新手口訣：看到正乖離偏高先忍住不追高，等股價拉回靠近月線更安全。",
+  },
+  {
+    key: "volume_ratio",
+    title: "成交量倍數",
+    code: "VOL RATIO",
+    metaphor: "生活比喻：店門口今天的「排隊人潮和平常比多了幾倍」。",
+    desc: "今日成交量除以近 5 日平均量。1.0x 代表平常熱度；1.5x 以上代表市場突然聚焦。若「價漲量增」代表買氣有跟上；若「爆量長黑下跌」則要提防大戶急著撤退。",
+    tip: "新手口訣：價漲搭配溫和放量較健康，無量上漲或爆量下殺都要提高警覺。",
+  },
+  {
+    key: "rsi",
+    title: "RSI 體溫計 (14 日)",
+    code: "RSI14",
+    metaphor: "生活比喻：測量市場買賣情緒的「體溫計（0～100 度）」。",
+    desc: "比較近 14 天漲幅與跌幅的力道。70 以上像發燒「過熱」，短線追高容易燙傷；45～70 屬於健康或偏強區間；30 以下像體溫過低「超賣」，代表賣壓宣洩過度、可能醞釀反彈，但仍要等止跌訊號。",
+    tip: "新手口訣：過熱(>70)不急著追，超賣(<30)不急著一把接刀，分批最安心。",
+  },
+  {
+    key: "atr",
+    title: "平均波動幅度 (ATR 14 日)",
+    code: "ATR14 %",
+    metaphor: "生活比喻：這檔股票平常一天會「搖晃多大」的避震器讀數。",
+    desc: "統計近 14 個交易日平均每日價格震盪百分比。數值低（1%～2%）像搭公車般平穩；數值高（3.5% 以上）像搭雲霄飛車，單日上下劇烈，部位應該縮小、停損空間也要留得更合理。",
+    tip: "新手口訣：波動越大的股票，投入金額越要縮小，才不會被正常震盪嚇出場。",
+  },
+  {
+    key: "support_resistance",
+    title: "支撐價 / 壓力價",
+    code: "SUPPORT / RESISTANCE",
+    metaphor: "生活比喻：股價近期的「地板（防守價）」與「天花板（壓力價）」。",
+    desc: "支撐價是近 20 日跌到附近就常有買盤承接的參考地板；壓力價是漲到附近常有人想先獲利了結的參考天花板。離地板近時防守容易算，逼近天花板時則要觀察能不能放量突破。",
+    tip: "新手口訣：參考防守價可用來思考停損點，買在接近天花板位置則報酬空間較窄。",
+  },
+  {
+    key: "stop_loss_profit",
+    title: "停損價 / 停利價",
+    code: "STOP LOSS / TAKE PROFIT",
+    metaphor: "生活比喻：投資的「安全氣囊」與「到站下車鬧鐘」。",
+    desc: "停損價是下單前就先決定好「看錯最多願意賠多少就自動賣出」，避免小虧滾成大套牢；停利價是漲到目標就先落袋為安，防止帳面獲利坐過山車又吐回去。",
+    tip: "新手口訣：進場前先設好停損價（常見買價 -5% 或參考防守價下方），再決定買幾股。",
+  },
+  {
+    key: "max_drawdown",
+    title: "歷史最大回撤與獲利因子",
+    code: "MDD / PROFIT FACTOR",
+    metaphor: "生活比喻：「從山頂摔到谷底最痛的一次」與「賺的錢是賠的錢的幾倍」。",
+    desc: "歷史最大連續回檔（最大回撤）顯示回測期間訊號最慘曾連續回吐多少百分比，用來預先評估心理承受度；獲利因子＝總獲利÷總虧損，大於 1 代表長期賺多賠少，數值越高策略越穩健。",
+    tip: "新手口訣：不能只看命中率，同時看最大回檔與賺賠比，才知道策略扛不扛得住逆風。",
+  },
+  {
+    key: "risk_guard",
+    title: "單標上限 20% 與冷靜鎖",
+    code: "RISK GUARD",
+    metaphor: "生活比喻：「雞蛋不放同一個籃子」加上「衝動暫停鍵」。",
+    desc: "本系統規定單一股票最多只佔模擬總資產 20%，避免重壓一檔踩雷傷筋動骨；當日已實現虧損達 -5% 或短時間內連續頻繁下單時，系統會自動鎖住買進功能，強迫先冷靜再做決定。",
+    tip: "新手口訣：風控不是為了限制獲利，而是確保你在最衝動的時候不會把本金輸光。",
+  },
+];
+
+function helpTipBtn(termKey, ariaLabel) {
+  return el("button", {
+    type: "button",
+    class: "help-tip-btn",
+    "data-glossary": termKey,
+    "aria-label": ariaLabel || "查看名詞白話解釋",
+    text: "?",
+  });
+}
+
+function syncGuideRestoreButton() {
+  const restoreBtn = document.getElementById("btn-restore-guide");
+  if (!restoreBtn) return;
+  const dismissed = localStorage.getItem(GUIDE_STORAGE_KEY) === "1";
+  restoreBtn.textContent = dismissed ? "重新顯示 3 步驟導引" : "3 步驟導引已顯示";
+  restoreBtn.disabled = !dismissed;
+}
+
+function applyGuideVisibility() {
+  const guide = document.getElementById("beginner-guide");
+  if (!guide) return;
+  const dismissed = localStorage.getItem(GUIDE_STORAGE_KEY) === "1";
+  guide.classList.toggle("hidden", dismissed);
+  syncGuideRestoreButton();
+}
+
+function dismissGuide() {
+  localStorage.setItem(GUIDE_STORAGE_KEY, "1");
+  applyGuideVisibility();
+}
+
+function restoreGuide() {
+  localStorage.removeItem(GUIDE_STORAGE_KEY);
+  applyGuideVisibility();
+  switchTab("tab-market");
+  closeGlossary();
+  const guide = document.getElementById("beginner-guide");
+  if (guide) guide.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function renderGlossary(highlightKey = null) {
+  const body = document.getElementById("glossary-body");
+  if (!body) return;
+  body.replaceChildren(
+    ...GLOSSARY_TERMS.map((item) =>
+      el(
+        "article",
+        {
+          class: `glossary-item${highlightKey === item.key ? " highlighted" : ""}`,
+          "data-term-key": item.key,
+        },
+        [
+          el("div", { class: "glossary-item-head" }, [
+            el("h4", { text: item.title }),
+            el("span", { class: "glossary-term-code", text: item.code }),
+          ]),
+          el("p", { class: "glossary-metaphor", text: item.metaphor }),
+          el("p", { class: "glossary-desc", text: item.desc }),
+          el("p", { class: "glossary-tip", text: item.tip }),
+        ],
+      ),
+    ),
+  );
+}
+
+function openGlossary(termKey = null) {
+  const modal = document.getElementById("glossary-modal");
+  if (!modal) return;
+  renderGlossary(termKey);
+  syncGuideRestoreButton();
+  modal.classList.remove("hidden");
+  if (termKey) {
+    const target = modal.querySelector(`[data-term-key="${termKey}"]`);
+    if (target) {
+      requestAnimationFrame(() => target.scrollIntoView({ behavior: "smooth", block: "center" }));
+    }
+  }
+  const closeBtn = document.getElementById("glossary-close");
+  if (closeBtn) closeBtn.focus();
+}
+
+function closeGlossary() {
+  const modal = document.getElementById("glossary-modal");
+  if (modal) modal.classList.add("hidden");
+}
+
+function rsiTagClass(rsiLabel, rsi14) {
+  const label = String(rsiLabel || "");
+  const val = isFiniteNum(rsi14) ? Number(rsi14) : null;
+  if (label.includes("過熱") || (val !== null && val > 70)) return "tag-HEAVY_BUY";
+  if (label.includes("偏強") || (val !== null && val >= 55)) return "tag-ADD";
+  if (label.includes("超賣") || (val !== null && val < 30)) return "tag-SELL";
+  if (label.includes("偏弱") || (val !== null && val < 45)) return "tag-HOLD";
+  return "tag-neutral";
+}
+
+function atrPlainDesc(atrPct) {
+  const val = Number(atrPct);
+  if (val >= 3.5) return "波動偏大・部位宜縮小";
+  if (val >= 2.0) return "波動適中";
+  return "相對平穩";
+}
 
 /** 安全建立 DOM 節點，全部動態文字皆透過 textContent 寫入以避免 XSS。 */
 function el(tag, attrs = {}, children = []) {
@@ -89,6 +270,95 @@ function renderInspector(stock) {
   }
 
   const chgCls = stock.change_pct >= 0 ? "pos" : "neg";
+  const closePrice = isFiniteNum(stock.latest_close) ? Number(stock.latest_close) : null;
+  const hasRsi = isFiniteNum(stock.rsi14);
+  const hasAtr = isFiniteNum(stock.atr14_pct);
+  const hasSupport = isFiniteNum(stock.support_price);
+  const hasResistance = isFiniteNum(stock.resistance_price);
+  const hasSuggestedSl = isFiniteNum(stock.suggested_stop_loss);
+  const hasSuggestedTp = isFiniteNum(stock.suggested_take_profit);
+  const hasLevels = hasSupport || hasResistance || hasSuggestedSl || hasSuggestedTp;
+
+  const pctFromClose = (target) => {
+    if (!closePrice || closePrice <= 0 || !isFiniteNum(target)) return "";
+    const diff = ((Number(target) - closePrice) / closePrice) * 100;
+    return `距現價 ${diff >= 0 ? "+" : ""}${diff.toFixed(1)}%`;
+  };
+
+  const rsiValueChildren = hasRsi
+    ? [
+        el("strong", { class: "mono", text: `${Number(stock.rsi14).toFixed(2)}` }),
+        stock.rsi_label
+          ? el("span", {
+              class: `tag metric-inline-tag ${rsiTagClass(stock.rsi_label, stock.rsi14)}`,
+              text: stock.rsi_label,
+            })
+          : null,
+      ]
+    : [el("strong", { class: "mono", text: "--" })];
+
+  const atrBoxChildren = [
+    el("div", { class: "metric-label-row" }, [
+      el("span", { text: "近 14 日平均波動" }),
+      helpTipBtn("atr", "了解近 14 日平均波動幅度 ATR"),
+    ]),
+    el("strong", {
+      class: "mono",
+      text: hasAtr ? `${Number(stock.atr14_pct).toFixed(2)}%` : "--",
+    }),
+    hasAtr ? el("span", { class: "metric-sub", text: atrPlainDesc(stock.atr14_pct) }) : null,
+  ];
+
+  const levelsCard = hasLevels
+    ? el("div", { class: "levels-card" }, [
+        el("div", { class: "levels-head" }, [
+          el("span", { text: "參考價位與建議停損／停利" }),
+          helpTipBtn("support_resistance", "了解支撐價與壓力價"),
+        ]),
+        el("div", { class: "levels-grid" }, [
+          el("div", { class: "level-item" }, [
+            el("span", { class: "level-label", text: "參考防守價（支撐）" }),
+            el("strong", {
+              class: "level-val mono",
+              text: hasSupport ? `${fmtMoney(stock.support_price)} 元` : "--",
+            }),
+            hasSupport ? el("span", { class: "level-meta mono", text: pctFromClose(stock.support_price) }) : null,
+          ]),
+          el("div", { class: "level-item" }, [
+            el("span", { class: "level-label", text: "參考壓力價" }),
+            el("strong", {
+              class: "level-val mono",
+              text: hasResistance ? `${fmtMoney(stock.resistance_price)} 元` : "--",
+            }),
+            hasResistance ? el("span", { class: "level-meta mono", text: pctFromClose(stock.resistance_price) }) : null,
+          ]),
+          el("div", { class: "level-item" }, [
+            el("span", { class: "level-label" }, [
+              el("span", { text: "建議停損價" }),
+              helpTipBtn("stop_loss_profit", "了解停損價與停利價"),
+            ]),
+            el("strong", {
+              class: "level-val mono neg",
+              text: hasSuggestedSl ? `${fmtMoney(stock.suggested_stop_loss)} 元` : "--",
+            }),
+            hasSuggestedSl ? el("span", { class: "level-meta mono", text: pctFromClose(stock.suggested_stop_loss) }) : null,
+          ]),
+          el("div", { class: "level-item" }, [
+            el("span", { class: "level-label", text: "建議停利價" }),
+            el("strong", {
+              class: "level-val mono pos",
+              text: hasSuggestedTp ? `${fmtMoney(stock.suggested_take_profit)} 元` : "--",
+            }),
+            hasSuggestedTp ? el("span", { class: "level-meta mono", text: pctFromClose(stock.suggested_take_profit) }) : null,
+          ]),
+        ]),
+      ])
+    : null;
+
+  const orderBtnLabel = hasSuggestedSl || hasSuggestedTp
+    ? "依建議停損／停利前往模擬下單"
+    : "前往模擬下單";
+
   panel.replaceChildren(
     el("div", { class: "inspector-header" }, [
       el("div", {}, [
@@ -108,28 +378,43 @@ function renderInspector(stock) {
     ]),
     el("div", { class: "metric-grid" }, [
       el("div", { class: "metric-box" }, [
-        el("span", { text: "健康度評分" }),
+        el("div", { class: "metric-label-row" }, [el("span", { text: "健康度評分" })]),
         el("strong", { class: "mono", text: `${stock.health_score} / 100` }),
       ]),
       el("div", { class: "metric-box" }, [
-        el("span", { text: "月線 MA20 / 乖離" }),
+        el("div", { class: "metric-label-row" }, [
+          el("span", { text: "月線 MA20 / 乖離" }),
+          helpTipBtn("ma20", "了解月線 MA20 與乖離率"),
+        ]),
         el("strong", { class: "mono", text: `${fmtMoney(stock.ma20)} (${stock.bias_pct >= 0 ? "+" : ""}${stock.bias_pct}%)` }),
       ]),
       el("div", { class: "metric-box" }, [
-        el("span", { text: "成交量能倍數" }),
+        el("div", { class: "metric-label-row" }, [
+          el("span", { text: "成交量能倍數" }),
+          helpTipBtn("volume_ratio", "了解成交量倍數"),
+        ]),
         el("strong", { class: "mono", text: `${stock.volume_ratio}x` }),
       ]),
       el("div", { class: "metric-box" }, [
-        el("span", { text: "近 10 日上漲勝率" }),
+        el("div", { class: "metric-label-row" }, [el("span", { text: "近 10 日上漲勝率" })]),
         el("strong", { class: "mono", text: `${stock.win_rate_nd}%` }),
       ]),
+      el("div", { class: "metric-box" }, [
+        el("div", { class: "metric-label-row" }, [
+          el("span", { text: "RSI 體溫狀態" }),
+          helpTipBtn("rsi", "了解 RSI 體溫計"),
+        ]),
+        el("div", {}, rsiValueChildren),
+      ]),
+      el("div", { class: "metric-box" }, atrBoxChildren),
     ]),
+    levelsCard,
     el("p", { class: "rationale-box", text: stock.plain_reason }),
-    el("div", { class: "btn-group" }, [
+    el("div", { class: "btn-group inspector-actions" }, [
       el("button", {
         type: "button",
         class: "btn btn-primary",
-        text: "前往模擬下單",
+        text: orderBtnLabel,
         onclick: () => prefillOrder(stock),
       }),
       el("button", {
@@ -154,6 +439,7 @@ function renderInspector(stock) {
 function renderOverview(data) {
   const { portfolio, daily_report: report, stocks } = data;
   state.stocks = stocks;
+  state.portfolio = portfolio || null;
 
   // 資料源指示與降級提示
   const sourceSel = document.getElementById("source-select");
@@ -263,6 +549,7 @@ function renderOverview(data) {
   renderInspector(stocks.find((s) => s.symbol === state.selectedSymbol) || null);
   syncSymbolSelects(stocks);
   renderPortfolioTables(portfolio);
+  updateOrderRiskPreview();
 }
 
 function syncSymbolSelects(stocks) {
@@ -373,25 +660,35 @@ function setOrderSide(side) {
   document.getElementById("order-side").value = normalized;
   document.getElementById("side-buy-btn").classList.toggle("active-buy", normalized === "BUY");
   document.getElementById("side-sell-btn").classList.toggle("active-sell", normalized === "SELL");
+  updateOrderRiskPreview();
 }
 
 function prefillPriceForSelected() {
   const sym = document.getElementById("order-symbol").value;
   const catKey = document.getElementById("order-category").value;
   let price = null;
+  let stockMeta = null;
   if (catKey && catKey !== "__watchlist__") {
     const foundCls = state.orderClassQuotes.find((q) => q.symbol === sym);
     if (foundCls) price = Number(foundCls.price);
   }
-  if (price === null) {
-    const found = state.stocks.find((s) => s.symbol === sym);
-    if (found) price = Number(found.latest_close);
+  const foundWatch = state.stocks.find((s) => s.symbol === sym);
+  if (foundWatch) {
+    stockMeta = foundWatch;
+    if (price === null) price = Number(foundWatch.latest_close);
   }
   if (price !== null && price > 0) {
     document.getElementById("order-price").value = price;
-    document.getElementById("order-sl").value = (price * 0.95).toFixed(2);
-    document.getElementById("order-tp").value = (price * 1.1).toFixed(2);
+    const slVal = stockMeta && isFiniteNum(stockMeta.suggested_stop_loss) && Number(stockMeta.suggested_stop_loss) > 0
+      ? Number(stockMeta.suggested_stop_loss)
+      : price * 0.95;
+    const tpVal = stockMeta && isFiniteNum(stockMeta.suggested_take_profit) && Number(stockMeta.suggested_take_profit) > 0
+      ? Number(stockMeta.suggested_take_profit)
+      : price * 1.1;
+    document.getElementById("order-sl").value = slVal.toFixed(2);
+    document.getElementById("order-tp").value = tpVal.toFixed(2);
   }
+  updateOrderRiskPreview();
 }
 
 function prefillOrder(stock) {
@@ -400,7 +697,184 @@ function prefillOrder(stock) {
   document.getElementById("order-symbol").value = stock.symbol;
   setOrderSide(stock.action === "SELL" ? "SELL" : "BUY");
   prefillPriceForSelected();
+  if (isFiniteNum(stock.latest_close) && Number(stock.latest_close) > 0) {
+    const price = Number(stock.latest_close);
+    document.getElementById("order-price").value = price;
+    document.getElementById("order-sl").value = (
+      isFiniteNum(stock.suggested_stop_loss) && Number(stock.suggested_stop_loss) > 0
+        ? Number(stock.suggested_stop_loss)
+        : price * 0.95
+    ).toFixed(2);
+    document.getElementById("order-tp").value = (
+      isFiniteNum(stock.suggested_take_profit) && Number(stock.suggested_take_profit) > 0
+        ? Number(stock.suggested_take_profit)
+        : price * 1.1
+    ).toFixed(2);
+  }
+  updateOrderRiskPreview();
   switchTab("tab-trade");
+}
+
+function updateOrderRiskPreview() {
+  const box = document.getElementById("order-risk-preview");
+  if (!box) return;
+
+  const side = document.getElementById("order-side").value || "BUY";
+  const symbol = document.getElementById("order-symbol").value || "";
+  const qty = Number(document.getElementById("order-qty").value);
+  const price = Number(document.getElementById("order-price").value);
+  const slRaw = document.getElementById("order-sl").value.trim();
+  const tpRaw = document.getElementById("order-tp").value.trim();
+  const sl = slRaw !== "" ? Number(slRaw) : null;
+  const tp = tpRaw !== "" ? Number(tpRaw) : null;
+
+  const validOrder = Number.isFinite(qty) && qty > 0 && Number.isFinite(price) && price > 0;
+  const orderValue = validOrder ? qty * price : 0;
+  const totalEquity = state.portfolio && isFiniteNum(state.portfolio.total_equity)
+    ? Number(state.portfolio.total_equity)
+    : 0;
+  const cashBalance = state.portfolio && isFiniteNum(state.portfolio.cash_balance)
+    ? Number(state.portfolio.cash_balance)
+    : null;
+  const allocPct = totalEquity > 0 && validOrder ? (orderValue / totalEquity) * 100 : null;
+
+  let existingValue = 0;
+  if (state.portfolio && Array.isArray(state.portfolio.positions) && symbol) {
+    const pos = state.portfolio.positions.find((p) => p.symbol === symbol);
+    if (pos && isFiniteNum(pos.quantity) && isFiniteNum(pos.current_price)) {
+      existingValue = Number(pos.quantity) * Number(pos.current_price);
+    }
+  }
+  const combinedPct = totalEquity > 0 && validOrder ? ((existingValue + orderValue) / totalEquity) * 100 : null;
+
+  const notes = [];
+  let stateClass = "";
+
+  if (!validOrder) {
+    box.className = "risk-preview";
+    box.replaceChildren(
+      el("div", { class: "risk-preview-head" }, [
+        el("span", { text: "下單前即時風險試算" }),
+        helpTipBtn("risk_guard", "了解單標 20% 上限與停損風險"),
+      ]),
+      el("p", { class: "risk-note risk-note-ok", text: "請輸入有效的委託股數與價格，系統會即時試算佔比與停損風險。" }),
+    );
+    return;
+  }
+
+  let lossDisplay = "--";
+  let lossSubCls = "";
+
+  if (side === "BUY") {
+    const overSingle = allocPct !== null && allocPct > 20;
+    const overCombined = !overSingle && existingValue > 0 && combinedPct !== null && combinedPct > 20;
+    if (overSingle) {
+      stateClass = "risk-state-danger";
+      notes.push({
+        cls: "risk-note-danger",
+        text: "超過單標 20% 安全線，送單時會被風控攔截",
+      });
+    } else if (overCombined) {
+      stateClass = "risk-state-danger";
+      notes.push({
+        cls: "risk-note-danger",
+        text: `加上既有持倉後達 ${combinedPct.toFixed(1)}%，超過單標 20% 安全線，送單時會被風控攔截`,
+      });
+    }
+
+    if (cashBalance !== null && orderValue > cashBalance) {
+      stateClass = "risk-state-danger";
+      notes.push({
+        cls: "risk-note-danger",
+        text: `委託總額超過可用模擬現金（剩餘 ${fmtMoney(cashBalance)} 元）`,
+      });
+    }
+
+    if (sl === null || !Number.isFinite(sl) || sl <= 0) {
+      lossDisplay = "未設定";
+      lossSubCls = "risk-note-warn";
+      if (!stateClass) stateClass = "risk-state-warn";
+      notes.push({
+        cls: "risk-note-warn",
+        text: `尚未設定停損價，建議至少設在買價 -5%（約 ${(price * 0.95).toFixed(2)} 元）`,
+      });
+    } else if (sl >= price) {
+      lossDisplay = "設定無效";
+      lossSubCls = "risk-note-warn";
+      if (!stateClass) stateClass = "risk-state-warn";
+      notes.push({
+        cls: "risk-note-warn",
+        text: `停損價需低於買進委託價（${fmtMoney(price)} 元）才能發揮止損保護`,
+      });
+    } else {
+      const estLoss = (price - sl) * qty;
+      const slDistPct = ((price - sl) / price) * 100;
+      lossDisplay = `-${fmtMoney(estLoss)} 元 (-${slDistPct.toFixed(1)}%)`;
+      if (slDistPct > 15) {
+        if (!stateClass) stateClass = "risk-state-warn";
+        notes.push({
+          cls: "risk-note-warn",
+          text: `停損距離達 ${slDistPct.toFixed(1)}%（超過 15%），空間偏寬恐失去風險保護意義`,
+        });
+      }
+      if (tp !== null && Number.isFinite(tp) && tp > price) {
+        const estGain = (tp - price) * qty;
+        const rr = (tp - price) / (price - sl);
+        notes.push({
+          cls: "risk-note-ok",
+          text: `若達停利預估獲利 +${fmtMoney(estGain)} 元（預估賺賠比 ${rr.toFixed(1)} : 1）`,
+        });
+      }
+    }
+
+    if (!notes.length) {
+      notes.push({
+        cls: "risk-note-ok",
+        text: "單標配置在 20% 安全線內且已設停損，可點擊下方按鈕進行風控預覽。",
+      });
+    }
+  } else {
+    lossDisplay = "賣出減碼";
+    notes.push({
+      cls: "risk-note-ok",
+      text: "賣出委託會減少持倉並釋放模擬現金（不受單標 20% 上限與冷靜鎖限制）。",
+    });
+  }
+
+  const barFill = el("div", {
+    class: `risk-bar-fill${side === "BUY" && ((allocPct !== null && allocPct > 20) || (combinedPct !== null && combinedPct > 20)) ? " over-limit" : ""}`,
+  });
+  const barPct = allocPct !== null ? Math.min(100, (allocPct / 25) * 100) : 0;
+  barFill.style.width = `${barPct.toFixed(1)}%`;
+
+  box.className = `risk-preview${stateClass ? ` ${stateClass}` : ""}`;
+  box.replaceChildren(
+    el("div", { class: "risk-preview-head" }, [
+      el("span", { text: "下單前即時風險試算" }),
+      helpTipBtn("risk_guard", "了解單標 20% 上限與停損試算"),
+    ]),
+    el("div", { class: "risk-preview-grid" }, [
+      el("div", { class: "risk-metric" }, [
+        el("span", { text: "本次委託總金額 / 佔總資產" }),
+        el("strong", {
+          class: `mono${side === "BUY" && allocPct !== null && allocPct > 20 ? " pos" : ""}`,
+          text: allocPct !== null
+            ? `${fmtMoney(orderValue)} 元 (${allocPct.toFixed(1)}%)`
+            : `${fmtMoney(orderValue)} 元`,
+        }),
+      ]),
+      el("div", { class: "risk-metric" }, [
+        el("span", { text: side === "BUY" ? "若觸發停損預估虧損" : "預估動作" }),
+        el("strong", { class: `mono ${lossSubCls}`, text: lossDisplay }),
+      ]),
+    ]),
+    side === "BUY" && allocPct !== null ? el("div", { class: "risk-bar-track" }, [barFill]) : null,
+    el(
+      "div",
+      { class: "risk-notes" },
+      notes.map((n) => el("p", { class: `risk-note ${n.cls}`, text: n.text })),
+    ),
+  );
 }
 
 async function removeWatchlistSymbol(symbol) {
@@ -700,12 +1174,49 @@ async function loadRealityCheck() {
   if (!res.ok) return;
   const d = res.data;
   const summaryEl = document.getElementById("reality-summary");
+
+  const extraChips = [];
+  if (isFiniteNum(d.max_drawdown_pct)) {
+    const mddVal = Math.abs(Number(d.max_drawdown_pct)).toFixed(2);
+    extraChips.push(
+      el("span", { class: "reality-chip" }, [
+        el("span", { text: "歷史最大連續回檔" }),
+        el("strong", { class: Number(mddVal) > 0 ? "neg" : "", text: `-${mddVal}%` }),
+        helpTipBtn("max_drawdown", "了解歷史最大連續回檔與獲利因子"),
+      ]),
+    );
+  }
+  if (isFiniteNum(d.profit_factor)) {
+    extraChips.push(
+      el("span", { class: "reality-chip" }, [
+        el("span", { text: "獲利因子（總賺÷總賠）" }),
+        el("strong", { text: `${Number(d.profit_factor).toFixed(2)}x` }),
+      ]),
+    );
+  } else if (d.profit_factor === null && Number(d.directional_signals || 0) > 0) {
+    extraChips.push(
+      el("span", { class: "reality-chip" }, [
+        el("span", { text: "獲利因子" }),
+        el("strong", { text: "尚無虧損樣本" }),
+      ]),
+    );
+  }
+  if (isFiniteNum(d.win_loss_ratio)) {
+    extraChips.push(
+      el("span", { class: "reality-chip" }, [
+        el("span", { text: "平均賺賠比" }),
+        el("strong", { text: `${Number(d.win_loss_ratio).toFixed(2)}` }),
+      ]),
+    );
+  }
+
   summaryEl.replaceChildren(
     el("strong", {
       class: "mono",
       text: `資料源 ${d.source} ｜ 方向命中率 ${d.accuracy_pct}%（${d.directional_signals} 筆訊號）｜ 平均報酬 ${d.avg_signal_return_pct >= 0 ? "+" : ""}${d.avg_signal_return_pct}% ｜ 平均 ${d.horizon_days} 日波動 ${d.mae_pct}%`,
     }),
-    el("p", { style: "margin: 6px 0 0;", text: d.calibration_hint }),
+    extraChips.length ? el("div", { class: "reality-metrics" }, extraChips) : null,
+    el("p", { style: "margin: 8px 0 0;", text: d.calibration_hint }),
   );
 
   const body = document.getElementById("reality-body");
@@ -811,6 +1322,44 @@ function wireEvents() {
     applyTheme(cur);
   });
 
+  applyGuideVisibility();
+  const dismissGuideBtn = document.getElementById("btn-dismiss-guide");
+  if (dismissGuideBtn) dismissGuideBtn.addEventListener("click", dismissGuide);
+  const restoreGuideBtn = document.getElementById("btn-restore-guide");
+  if (restoreGuideBtn) restoreGuideBtn.addEventListener("click", restoreGuide);
+  const guideGlossaryBtn = document.getElementById("btn-guide-glossary");
+  if (guideGlossaryBtn) guideGlossaryBtn.addEventListener("click", () => openGlossary());
+  const openGlossaryBtn = document.getElementById("btn-open-glossary");
+  if (openGlossaryBtn) openGlossaryBtn.addEventListener("click", () => openGlossary());
+  const glossaryCloseBtn = document.getElementById("glossary-close");
+  if (glossaryCloseBtn) glossaryCloseBtn.addEventListener("click", closeGlossary);
+  const glossaryModal = document.getElementById("glossary-modal");
+  if (glossaryModal) {
+    glossaryModal.addEventListener("click", (ev) => {
+      if (ev.target === glossaryModal) closeGlossary();
+    });
+  }
+
+  const guideStep1 = document.getElementById("guide-step-1");
+  if (guideStep1) {
+    guideStep1.addEventListener("click", () => {
+      const inspector = document.getElementById("stock-inspector");
+      if (inspector) inspector.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+  }
+  const guideStep2 = document.getElementById("guide-step-2");
+  if (guideStep2) guideStep2.addEventListener("click", () => switchTab("tab-trade"));
+  const guideStep3 = document.getElementById("guide-step-3");
+  if (guideStep3) guideStep3.addEventListener("click", () => switchTab("tab-forecast"));
+
+  document.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".help-tip-btn[data-glossary]");
+    if (!btn) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    openGlossary(btn.dataset.glossary);
+  });
+
   document.querySelectorAll(".nav-btn").forEach((btn) => {
     btn.addEventListener("click", () => switchTab(btn.dataset.tab));
   });
@@ -820,6 +1369,14 @@ function wireEvents() {
   document.getElementById("order-symbol").addEventListener("change", prefillPriceForSelected);
   document.getElementById("side-buy-btn").addEventListener("click", () => setOrderSide("BUY"));
   document.getElementById("side-sell-btn").addEventListener("click", () => setOrderSide("SELL"));
+  ["order-qty", "order-price", "order-sl", "order-tp"].forEach((id) => {
+    const input = document.getElementById(id);
+    if (input) {
+      input.addEventListener("input", updateOrderRiskPreview);
+      input.addEventListener("change", updateOrderRiskPreview);
+    }
+  });
+  updateOrderRiskPreview();
 
   const wlInput = document.getElementById("watchlist-input");
   wlInput.addEventListener("input", () => {
@@ -939,7 +1496,13 @@ function wireEvents() {
     if (ev.target === modal) closeConfirmModal();
   });
   document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape" && !modal.classList.contains("hidden")) closeConfirmModal();
+    if (ev.key !== "Escape") return;
+    const gModal = document.getElementById("glossary-modal");
+    if (gModal && !gModal.classList.contains("hidden")) {
+      closeGlossary();
+      return;
+    }
+    if (!modal.classList.contains("hidden")) closeConfirmModal();
   });
 
   document.getElementById("modal-confirm").addEventListener("click", async () => {

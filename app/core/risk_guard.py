@@ -105,6 +105,12 @@ class RiskGuard:
         if side == "BUY":
             if order.stop_loss_price is not None:
                 max_loss = (order.price - order.stop_loss_price) * order.quantity
+                stop_loss_dist_pct = (order.price - order.stop_loss_price) / order.price
+                if stop_loss_dist_pct > 0.15 + 1e-9:
+                    reasons.append(
+                        f"溫馨提醒：停損價距離買進價達 {stop_loss_dist_pct:.1%}（超過 15%），"
+                        "停損空間過寬恐失去本金保護意義，建議評估是否收緊停損距離"
+                    )
             else:
                 max_loss = order_notional
                 reasons.append("提醒：您未設定停損價，極端情況下最大可能虧損為整筆投入金額")

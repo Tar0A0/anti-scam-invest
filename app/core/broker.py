@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
@@ -165,7 +166,8 @@ def preview_order(
 ) -> RiskCheckResult:
     """下單前預覽：強制回傳二次確認所需之最大可能虧損金額與風控檢核結果。"""
     total_equity, cash_balance, symbol_value, daily_pnl = _account_metrics_for_symbol(conn, order.symbol, source=source)
-    if order.side.upper() == "BUY" and order.quantity * order.price > cash_balance:
+    side = (order.side or "").upper()
+    if side == "BUY" and order.quantity > 0 and math.isfinite(order.price) and order.price > 0 and order.quantity * order.price > cash_balance:
         return RiskCheckResult(
             allowed=False,
             reasons=[f"可用模擬現金不足（需要 {order.quantity * order.price:,.0f} 元，僅剩 {cash_balance:,.0f} 元）"],
@@ -173,7 +175,7 @@ def preview_order(
 
     preview_req = OrderRequest(
         symbol=order.symbol,
-        side=order.side,
+        side=side,
         quantity=order.quantity,
         price=order.price,
         stop_loss_price=order.stop_loss_price,
@@ -203,7 +205,7 @@ def execute_order(
     total_equity, cash_balance, symbol_value, daily_pnl = _account_metrics_for_symbol(conn, order.symbol, source=source)
     side = (order.side or "").upper()
 
-    if side == "BUY" and take_profit_price is not None and take_profit_price <= order.price:
+    if side == "BUY" and take_profit_price is not None and (not math.isfinite(take_profit_price) or take_profit_price <= order.price):
         return (False, RiskCheckResult(allowed=False, reasons=["停利目標價必須高於買進價格"]), None)
 
     check = guard.evaluate_order(
@@ -241,6 +243,11 @@ def execute_order(
     notional = round(order.quantity * order.price, 2)
 
     with conn:
+        acct = conn.execute("SELECT cash_balance, daily_realized_pnl FROM account_state WHERE id = 1;").fetchone()
+        if acct is None:
+            raise RuntimeError("找不到 account_state（請先執行 init_db）")
+        cash_balance = round(float(acct["cash_balance"]), 2)
+        daily_pnl = round(float(acct["daily_realized_pnl"]), 2)
         pos = conn.execute("SELECT * FROM positions WHERE symbol = ?;", (order.symbol,)).fetchone()
         if side == "BUY":
             if notional > cash_balance:

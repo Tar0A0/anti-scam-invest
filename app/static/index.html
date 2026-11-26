@@ -50,6 +50,10 @@
       </nav>
 
       <div class="sidebar-footer">
+        <button id="btn-open-glossary" class="theme-btn" type="button" aria-label="開啟新手名詞白話小教室">
+          <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><path d="M9 9.5a3 3 0 0 1 5.5 1.5c0 1.5-2.5 2-2.5 3.5"/><line x1="12" y1="17.5" x2="12.01" y2="17.5"/></svg>
+          <span>新手小教室</span>
+        </button>
         <button id="btn-theme-toggle" class="theme-btn" type="button" aria-label="切換深淺色主題">
           <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
           <span id="theme-label">深色終端模式</span>
@@ -103,12 +107,12 @@
           <div class="strip-cell">
             <span class="strip-label">可用模擬現金</span>
             <strong id="kpi-cash" class="strip-value mono">--</strong>
-            <span class="strip-sub">單標配置上限 20%</span>
+            <span class="strip-sub strip-sub-help">單標配置上限 20% <button class="help-tip-btn" type="button" data-glossary="risk_guard" aria-label="了解單標上限 20% 與冷靜鎖">?</button></span>
           </div>
           <div class="strip-cell">
             <span class="strip-label">今日已實現損益</span>
             <strong id="kpi-pnl" class="strip-value mono">--</strong>
-            <span class="strip-sub">單日 -5% 啟動冷靜鎖</span>
+            <span class="strip-sub strip-sub-help">單日 -5% 啟動冷靜鎖 <button class="help-tip-btn" type="button" data-glossary="risk_guard" aria-label="了解冷靜鎖保護機制">?</button></span>
           </div>
           <div class="strip-cell">
             <span class="strip-label">市場平均健康度</span>
@@ -117,8 +121,50 @@
           </div>
         </section>
 
-        <!-- 分頁 1：盤勢總覽（報社摘要條 + 左表右檢視器） -->
+        <!-- 分頁 1：盤勢總覽（新手 3 步驟導引 + 報社摘要條 + 左表右檢視器） -->
         <section id="tab-market" class="tab-panel active">
+          <section id="beginner-guide" class="guide-strip" aria-label="新手 3 步驟上手導引">
+            <div class="guide-head">
+              <div>
+                <span class="eyebrow">BEGINNER GUIDE · 新手 3 步驟</span>
+                <p class="guide-title">第一次看股票？用模擬金照這三步慢慢練，零壓力搞懂風險</p>
+              </div>
+              <div class="btn-group">
+                <button id="btn-guide-glossary" class="btn btn-ghost btn-sm" type="button">名詞小教室</button>
+                <button id="btn-dismiss-guide" class="btn btn-ghost btn-sm" type="button">不再顯示</button>
+              </div>
+            </div>
+            <ol class="guide-steps">
+              <li>
+                <button id="guide-step-1" class="guide-step-btn" type="button">
+                  <span class="guide-step-num mono">01</span>
+                  <span class="guide-step-copy">
+                    <strong>看白話建議挑標的</strong>
+                    <span>點選下方任一檔股票，先看右側白話理由、體溫與防守價</span>
+                  </span>
+                </button>
+              </li>
+              <li>
+                <button id="guide-step-2" class="guide-step-btn" type="button">
+                  <span class="guide-step-num mono">02</span>
+                  <span class="guide-step-copy">
+                    <strong>去模擬交易用假錢練設停損</strong>
+                    <span>先看下單前即時試算，確認不超 20% 上限並設定停損價</span>
+                  </span>
+                </button>
+              </li>
+              <li>
+                <button id="guide-step-3" class="guide-step-btn" type="button">
+                  <span class="guide-step-num mono">03</span>
+                  <span class="guide-step-copy">
+                    <strong>到情境模擬預演大跌風險</strong>
+                    <span>試拉大盤下跌情境與查看歷史回檔，提早感受市場波動</span>
+                  </span>
+                </button>
+              </li>
+            </ol>
+          </section>
+
           <article class="editorial-brief">
             <div class="brief-head">
               <div>
@@ -274,7 +320,7 @@
 
                 <div class="form-row">
                   <label class="field">
-                    <span>自動停損價 (選填)</span>
+                    <span class="field-label-inline">自動停損價 (選填) <button class="help-tip-btn" type="button" data-glossary="stop_loss_profit" aria-label="了解停損與停利價">?</button></span>
                     <input id="order-sl" class="mono" type="number" min="0.1" step="0.01" placeholder="建議買價 -5%" />
                   </label>
                   <label class="field">
@@ -282,6 +328,8 @@
                     <input id="order-tp" class="mono" type="number" min="0.1" step="0.01" placeholder="例如買價 +10%" />
                   </label>
                 </div>
+
+                <div id="order-risk-preview" class="risk-preview" aria-live="polite"></div>
 
                 <button class="btn btn-primary" type="submit">檢查風控並預覽下單</button>
               </form>
@@ -459,6 +507,24 @@
         <button id="modal-cancel" class="btn btn-ghost" type="button">再想一下（取消）</button>
         <button id="modal-confirm" class="btn btn-primary" type="button">我已了解風險，確認送出</button>
       </div>
+    </div>
+  </div>
+
+  <!-- 名詞白話小教室抽屜 -->
+  <div id="glossary-modal" class="drawer-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="glossary-title">
+    <div class="drawer-panel">
+      <div class="drawer-head">
+        <div>
+          <span class="eyebrow">BEGINNER GLOSSARY · 白話名詞小教室</span>
+          <h3 id="glossary-title">不背術語，用生活比喻看懂看盤數字</h3>
+        </div>
+        <button id="glossary-close" class="btn btn-ghost btn-sm" type="button" aria-label="關閉新手名詞小教室">關閉 (Esc)</button>
+      </div>
+      <div class="drawer-subbar">
+        <span class="muted-text">點選畫面上任一「?」圖示可直接跳至對應解說。</span>
+        <button id="btn-restore-guide" class="btn btn-ghost btn-sm" type="button">重新顯示 3 步驟導引</button>
+      </div>
+      <div id="glossary-body" class="drawer-body"></div>
     </div>
   </div>
 
