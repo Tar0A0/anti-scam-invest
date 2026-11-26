@@ -84,11 +84,13 @@ class AppService:
         self._live_wake = threading.Event()
         self._live_stop = threading.Event()
         self._live_thread: threading.Thread | None = None
+        self._live_immediate = False
         self._live_state: dict[str, Any] = {
             "enabled": True,
             "interval_sec": 60,
             "data_version": 1,
             "tick_count": 0,
+            "ticking": False,
             "last_tick_at": None,
             "next_tick_at": None,
             "last_status": "READY",
@@ -368,6 +370,8 @@ class AppService:
     def get_live_state(self) -> dict[str, Any]:
         with self._live_lock:
             state = dict(self._live_state)
+        state["server_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        state["active_source"] = self.active_source
         state["sync_status"] = self.get_class_sync_status()
         return state
 
@@ -377,20 +381,31 @@ class AppService:
         enabled: bool | None = None,
         interval_sec: int | None = None,
     ) -> dict[str, Any]:
-        """動態調整自動即時更新的開關與更新間隔（15~3600 秒）。"""
+        """動態調整自動即時更新的開關與更新間隔（15~3600 秒）；由暫停切回啟用或縮短間隔時立刻觸發一輪更新。"""
         if interval_sec is not None and not (15 <= interval_sec <= 3600):
             raise ValueError("更新間隔必須介於 15 到 3600 秒之間")
 
         with self._live_lock:
+            prev_enabled = bool(self._live_state["enabled"])
+            prev_interval = int(self._live_state["interval_sec"])
+
             if enabled is not None:
                 self._live_state["enabled"] = bool(enabled)
             if interval_sec is not None:
                 self._live_state["interval_sec"] = int(interval_sec)
 
+            now_utc = datetime.now(timezone.utc)
             if self._live_state["enabled"]:
-                nxt = datetime.now(timezone.utc) + timedelta(seconds=int(self._live_state["interval_sec"]))
-                self._live_state["next_tick_at"] = nxt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                resumed = not prev_enabled
+                shortened = interval_sec is not None and int(interval_sec) < prev_interval
+                if resumed or shortened:
+                    self._live_immediate = True
+                    self._live_state["next_tick_at"] = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                else:
+                    nxt = now_utc + timedelta(seconds=int(self._live_state["interval_sec"]))
+                    self._live_state["next_tick_at"] = nxt.strftime("%Y-%m-%dT%H:%M:%SZ")
             else:
+                self._live_immediate = False
                 self._live_state["next_tick_at"] = None
 
         self._live_wake.set()
@@ -398,6 +413,8 @@ class AppService:
 
     def run_live_tick(self) -> dict[str, Any]:
         """執行單次背景即時更新（抓價、重算白話策略與停損停利掃描）。"""
+        with self._live_lock:
+            self._live_state["ticking"] = True
         try:
             status, _, err_msg = self.job_fetch_market()
             now_utc = datetime.now(timezone.utc)
@@ -416,30 +433,93 @@ class AppService:
                 self._live_state["last_tick_at"] = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
                 self._live_state["last_status"] = "FAILED"
                 self._live_state["last_error"] = f"{type(exc).__name__}: {exc}"
+                if self._live_state["enabled"]:
+                    nxt = now_utc + timedelta(seconds=int(self._live_state["interval_sec"]))
+                    self._live_state["next_tick_at"] = nxt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        finally:
+            with self._live_lock:
+                self._live_state["ticking"] = False
         return self.get_live_state()
 
-    def start_live_updater(self) -> None:
-        """啟動背景即時更新執行緒，依設定間隔自動更新動態。"""
+    def _maybe_trigger_stale_class_sync(self) -> bool:
+        """若 yahoo_categories 已有資料但超過 30 分鐘或非今日台北日期未更新，背景觸發一次全類別同步。"""
+        with self._lock:
+            conn = get_connection(self.db_path)
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS cnt, MAX(updated_at) AS max_u FROM yahoo_categories;"
+                ).fetchone()
+            finally:
+                conn.close()
+
+        if not row or int(row["cnt"]) == 0:
+            return False
+
+        max_u = row["max_u"]
+        now_utc = datetime.now(timezone.utc)
+        today_tpe = now_utc.astimezone(TAIPEI_TZ).date()
+        is_stale = True
+        if isinstance(max_u, str) and max_u.strip():
+            try:
+                last_dt = datetime.fromisoformat(max_u.strip().replace("Z", "+00:00"))
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                age = now_utc - last_dt.astimezone(timezone.utc)
+                is_stale = age > timedelta(minutes=30) or last_dt.astimezone(TAIPEI_TZ).date() != today_tpe
+            except ValueError:
+                is_stale = True
+
+        if is_stale:
+            started, _ = self.start_async_class_sync()
+            return started
+        return False
+
+    def start_live_updater(self, *, initial_delay_sec: float = 1.0) -> None:
+        """啟動背景即時更新執行緒：啟動後短延遲即跑首輪同步，並依設定間隔自動更新動態。"""
         # shortcut: 單機背景輪詢執行緒搭配前端輕量版本檢查達成自動更新；未來若擴展多實例再改為 Redis Pub/Sub + WebSocket/SSE
         if self._live_thread is not None and self._live_thread.is_alive():
             return
 
         self._live_stop.clear()
         self._live_wake.clear()
+        delay = max(0.0, float(initial_delay_sec))
         with self._live_lock:
+            self._live_immediate = False
             if self._live_state["enabled"]:
-                nxt = datetime.now(timezone.utc) + timedelta(seconds=int(self._live_state["interval_sec"]))
+                nxt = datetime.now(timezone.utc) + timedelta(seconds=delay)
                 self._live_state["next_tick_at"] = nxt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         def _worker() -> None:
+            if delay > 0:
+                self._live_stop.wait(timeout=delay)
+            if self._live_stop.is_set():
+                return
+
+            try:
+                self._maybe_trigger_stale_class_sync()
+            except Exception:  # noqa: BLE001 - 背景類股補新不可中斷即時報價更新迴圈
+                pass
+
+            with self._live_lock:
+                run_initial = bool(self._live_state["enabled"])
+                self._live_immediate = False
+            if run_initial and not self._live_stop.is_set():
+                self.run_live_tick()
+
             while not self._live_stop.is_set():
                 with self._live_lock:
                     enabled = bool(self._live_state["enabled"])
                     interval = int(self._live_state["interval_sec"])
+                    immediate = bool(self._live_immediate)
+                    self._live_immediate = False
 
                 if not enabled:
                     self._live_wake.wait(timeout=10.0)
                     self._live_wake.clear()
+                    continue
+
+                if immediate:
+                    self.run_live_tick()
                     continue
 
                 woken = self._live_wake.wait(timeout=float(interval))
@@ -447,7 +527,7 @@ class AppService:
                 if self._live_stop.is_set():
                     break
                 if woken:
-                    # 使用者剛切換間隔或啟用狀態，依新間隔重新計時
+                    # 若是恢復啟用或縮短間隔，下一輪頂部會立即消費 _live_immediate 觸發更新
                     continue
                 self.run_live_tick()
 
@@ -463,26 +543,52 @@ class AppService:
             self._live_thread = None
 
     def job_fetch_market(self) -> tuple[str, int, str | None]:
-        """依目前啟用的資料源抓取行情 -> 驗證 -> 入庫 -> 重算策略並檢查停損停利。"""
+        """依目前啟用的資料源抓取行情 -> 驗證 -> 入庫 -> 重算策略並檢查停損停利（外部 HTTP 不鎖 DB）。"""
+        now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+        source = self.active_source
+
         with self._lock:
             conn = get_connection(self.db_path)
             try:
-                now_utc = datetime.now(timezone.utc).replace(microsecond=0)
                 watchlist = self._get_watchlist(conn)
-                if not watchlist:
-                    return ("SUCCESS", 0, None)
+            finally:
+                conn.close()
 
-                if self.active_source == "yahoo":
-                    saved, issues = self._fetch_yahoo_batch(conn, list(watchlist.keys()))
+        if not watchlist:
+            return ("SUCCESS", 0, None)
+
+        if source == "yahoo":
+            # 外部 Yahoo Finance 網路請求置於 self._lock 之外，避免阻塞 /api/live 與 /api/overview
+            quotes = self.yahoo_adapter.fetch_quotes(list(watchlist.keys()))
+            validation = validate_quotes(quotes, max_daily_change_pct=0.25)
+            issues = [f"{sym}: {err}" for sym, err in self.yahoo_adapter.last_errors.items()]
+            issues.extend(f"{i.symbol}: {i.reason}" for i in validation.issues)
+
+            with self._lock:
+                conn = get_connection(self.db_path)
+                try:
+                    current_watchlist = self._get_watchlist(conn)
+                    saved = save_validated_quotes(conn, validation)
                     cnt = conn.execute(
                         "SELECT COUNT(*) AS cnt FROM market_quotes WHERE source = 'yahoo';"
                     ).fetchone()["cnt"]
-                    run_strategy_and_save(conn, watchlist, source="yahoo")
+                    if current_watchlist:
+                        run_strategy_and_save(conn, current_watchlist, source="yahoo")
                     check_stop_triggers(conn, source="yahoo", now=now_utc)
-                    err_msg = "；".join(issues) if issues else None
-                    status = "SUCCESS" if not issues else ("PARTIAL" if cnt > 0 else "FAILED")
-                    self.bump_data_version()
-                    return (status, saved, err_msg)
+                finally:
+                    conn.close()
+
+            err_msg = "；".join(issues) if issues else None
+            status = "SUCCESS" if not issues else ("PARTIAL" if cnt > 0 else "FAILED")
+            self.bump_data_version()
+            return (status, saved, err_msg)
+
+        with self._lock:
+            conn = get_connection(self.db_path)
+            try:
+                current_watchlist = self._get_watchlist(conn)
+                if not current_watchlist:
+                    return ("SUCCESS", 0, None)
 
                 last_closes = get_latest_prices(conn, source="mock")
                 max_time_row = conn.execute(
@@ -495,13 +601,13 @@ class AppService:
                         fetch_time = min(latest_dt + timedelta(seconds=1), now_utc + timedelta(minutes=4))
 
                 quotes = self.mock_adapter.fetch_quotes(
-                    list(watchlist.keys()),
+                    list(current_watchlist.keys()),
                     last_closes=last_closes,
                     quote_time=fetch_time,
                 )
                 validation = validate_quotes(quotes, prev_closes=last_closes, now=now_utc)
                 saved = save_validated_quotes(conn, validation)
-                run_strategy_and_save(conn, watchlist, source="mock")
+                run_strategy_and_save(conn, current_watchlist, source="mock")
                 check_stop_triggers(conn, source="mock", now=now_utc)
 
                 err_msg = "；".join(f"{i.symbol}: {i.reason}" for i in validation.issues) if validation.issues else None

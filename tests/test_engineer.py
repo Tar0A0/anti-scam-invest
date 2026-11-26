@@ -7,6 +7,7 @@ import io
 import json
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ from app.adapters.base import Quote
 from app.core.broker import execute_order, preview_order
 from app.core.risk_guard import OrderRequest
 from app.core.scheduler import TaskScheduler
-from app.core.validator import validate_quotes
+from app.core.validator import save_validated_quotes, validate_quotes
 from app.db.database import CORE_TABLES, db_health_check, get_connection, init_db
 from app.web import AppService, _sanitize_csv_cell, create_server
 
@@ -193,6 +194,31 @@ class ValidatorResilienceTest(unittest.TestCase):
         self.assertEqual(len(res.valid_quotes), 1)
         self.assertEqual(len(res.issues), 10)
 
+    def test_save_validated_quotes_upserts_same_quote_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "upsert_test.db"
+            init_db(db_path)
+            ts = datetime(2026, 11, 25, 1, 0, tzinfo=timezone.utc)
+            first_bar = Quote("2330.TW", ts, 1000.0, 1010.0, 995.0, 1005.0, 15000, "yahoo")
+            updated_bar = Quote("2330.TW", ts, 1000.0, 1025.0, 995.0, 1020.0, 28500, "yahoo")
+
+            conn = get_connection(db_path)
+            try:
+                saved1 = save_validated_quotes(conn, validate_quotes([first_bar], now=ts + timedelta(minutes=10)))
+                saved2 = save_validated_quotes(conn, validate_quotes([updated_bar], now=ts + timedelta(minutes=10)))
+                self.assertEqual(saved1, 1)
+                self.assertEqual(saved2, 1)
+
+                rows = conn.execute(
+                    "SELECT open, high, low, close, volume FROM market_quotes WHERE symbol = '2330.TW' AND source = 'yahoo';"
+                ).fetchall()
+                self.assertEqual(len(rows), 1)
+                self.assertAlmostEqual(rows[0]["high"], 1025.0)
+                self.assertAlmostEqual(rows[0]["close"], 1020.0)
+                self.assertEqual(rows[0]["volume"], 28500)
+            finally:
+                conn.close()
+
 
 class ServiceAndCsvSecurityTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -289,6 +315,104 @@ class ServiceAndCsvSecurityTest(unittest.TestCase):
             self.assertFalse(preview.allowed)
         finally:
             conn.close()
+
+    def test_live_updater_runs_initial_tick_and_immediate_on_resume_or_shorten(self) -> None:
+        v0 = self.service.get_live_state()["data_version"]
+        self.assertEqual(self.service.get_live_state()["tick_count"], 0)
+        self.service.start_live_updater(initial_delay_sec=0.05)
+        try:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                st = self.service.get_live_state()
+                if st["tick_count"] >= 1:
+                    break
+                time.sleep(0.03)
+
+            st1 = self.service.get_live_state()
+            self.assertGreaterEqual(st1["tick_count"], 1)
+            self.assertGreater(st1["data_version"], v0)
+            self.assertIsNotNone(st1["last_tick_at"])
+            self.assertIsNotNone(st1["next_tick_at"])
+            self.assertIsNotNone(st1["server_time"])
+            self.assertEqual(st1["active_source"], "mock")
+            self.assertIn("sync_status", st1)
+
+            # 暫停後再切回啟用，應立刻觸發一輪更新而不需等滿 60 秒
+            ticks_before = st1["tick_count"]
+            self.service.update_live_config(enabled=False)
+            self.service.update_live_config(enabled=True)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if self.service.get_live_state()["tick_count"] > ticks_before:
+                    break
+                time.sleep(0.03)
+            self.assertGreater(self.service.get_live_state()["tick_count"], ticks_before)
+
+            # 縮短間隔（60 -> 15）亦應立即觸發一輪更新
+            ticks_before_shorten = self.service.get_live_state()["tick_count"]
+            self.service.update_live_config(interval_sec=15)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if self.service.get_live_state()["tick_count"] > ticks_before_shorten:
+                    break
+                time.sleep(0.03)
+            self.assertGreater(self.service.get_live_state()["tick_count"], ticks_before_shorten)
+        finally:
+            self.service.stop_live_updater()
+
+    def test_job_fetch_market_does_not_hold_db_lock_during_yahoo_network_call(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        ts = datetime(2026, 11, 25, 1, 0, tzinfo=timezone.utc)
+
+        class _SlowYahooAdapter:
+            source_name = "yahoo"
+
+            def __init__(self) -> None:
+                self.last_errors: dict[str, str] = {}
+
+            def fetch_quotes(self, symbols: list[str]) -> list[Quote]:
+                entered.set()
+                release.wait(timeout=5)
+                return [Quote(sym, ts, 100.0, 105.0, 99.0, 103.0, 12000, "yahoo") for sym in symbols]
+
+        self.service.yahoo_adapter = _SlowYahooAdapter()  # type: ignore[assignment]
+        self.service.active_source = "yahoo"
+
+        holder: dict[str, object] = {}
+        t = threading.Thread(target=lambda: holder.setdefault("res", self.service.job_fetch_market()))
+        t.start()
+        self.assertTrue(entered.wait(timeout=3))
+
+        # 外部抓 Yahoo 進行中時，get_live_state 與 get_overview 皆不應被鎖住
+        live = self.service.get_live_state()
+        self.assertEqual(live["active_source"], "yahoo")
+        overview = self.service.get_overview()
+        self.assertEqual(overview["active_source"], "yahoo")
+
+        release.set()
+        t.join(timeout=5)
+        status, saved, err = holder["res"]  # type: ignore[misc]
+        self.assertEqual(status, "SUCCESS")
+        self.assertEqual(saved, 5)
+        self.assertIsNone(err)
+
+    def test_stale_yahoo_categories_triggers_background_sync(self) -> None:
+        stale_iso = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn = get_connection(self.db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO yahoo_categories (category_key, group_type, name, updated_at) VALUES ('sec:stale', '上市', '半導體', ?);",
+                    (stale_iso,),
+                )
+        finally:
+            conn.close()
+
+        with mock.patch.object(self.service, "start_async_class_sync", return_value=(True, {})) as m_sync:
+            triggered = self.service._maybe_trigger_stale_class_sync()
+        self.assertTrue(triggered)
+        m_sync.assert_called_once()
 
 
 class _FakeSocket:

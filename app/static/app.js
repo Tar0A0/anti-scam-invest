@@ -11,12 +11,57 @@ const state = {
   orderClassQuotes: [],
   syncTimer: null,
   lastDataVersion: null,
+  lastTickCount: null,
+  lastTickAt: null,
+  liveState: null,
+  serverClockOffsetMs: 0,
+  liveRefreshing: false,
+  livePollInFlight: false,
+  lastZeroPollAt: 0,
+  initialOverviewLoadedAt: 0,
   searchTimer: null,
 };
 
 const fmtMoney = (n) => Number(n).toLocaleString("zh-TW", { maximumFractionDigits: 2 });
 const isFiniteNum = (v) => v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v));
 const GUIDE_STORAGE_KEY = "stockmate-guide-dismissed";
+
+function formatTaipeiTime(isoStr) {
+  if (!isoStr) return "";
+  const d = new Date(isoStr);
+  if (Number.isNaN(d.getTime())) return String(isoStr);
+  try {
+    return new Intl.DateTimeFormat("zh-TW", {
+      timeZone: "Asia/Taipei",
+      hour12: false,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    }).format(d);
+  } catch {
+    return d.toTimeString().slice(0, 8);
+  }
+}
+
+function formatTaipeiShort(isoStr) {
+  if (!isoStr) return "";
+  const d = new Date(isoStr);
+  if (Number.isNaN(d.getTime())) return String(isoStr);
+  try {
+    const parts = new Intl.DateTimeFormat("zh-TW", {
+      timeZone: "Asia/Taipei",
+      hour12: false,
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).formatToParts(d);
+    const get = (t) => (parts.find((p) => p.type === t) || {}).value || "";
+    return `${get("month")}/${get("day")} ${get("hour")}:${get("minute")}`;
+  } catch {
+    return String(isoStr);
+  }
+}
 
 const GLOSSARY_TERMS = [
   {
@@ -447,9 +492,14 @@ function renderOverview(data) {
   const dot = document.getElementById("source-dot");
   dot.classList.toggle("mock", data.active_source === "mock");
 
-  document.getElementById("latest-quote-pill").textContent = data.latest_quote_time
-    ? `報價 ${data.latest_quote_time}`
-    : report.report_date;
+  const quotePill = document.getElementById("latest-quote-pill");
+  if (data.latest_quote_time) {
+    quotePill.textContent = `行情 ${formatTaipeiShort(data.latest_quote_time)}`;
+    quotePill.title = `最新 K 線報價時間（台北時間，休市期間維持最近一筆）：${data.latest_quote_time}`;
+  } else {
+    quotePill.textContent = report.report_date;
+    quotePill.title = `報表日期：${report.report_date}`;
+  }
 
   const noticeBanner = document.getElementById("source-notice-banner");
   if (data.source_notice) {
@@ -555,11 +605,15 @@ function renderOverview(data) {
 function syncSymbolSelects(stocks) {
   const forecastSel = document.getElementById("forecast-symbol");
   const curForecast = forecastSel.value;
-  forecastSel.replaceChildren(
-    ...stocks.map((s) => el("option", { value: s.symbol, text: `${s.name} (${s.symbol}) · ${s.latest_close} 元` })),
-  );
-  if (curForecast && stocks.some((s) => s.symbol === curForecast)) {
-    forecastSel.value = curForecast;
+  const forecastKeys = [...forecastSel.options].map((o) => o.value).join(",");
+  const nextKeys = stocks.map((s) => s.symbol).join(",");
+  if (document.activeElement !== forecastSel || forecastKeys !== nextKeys) {
+    forecastSel.replaceChildren(
+      ...stocks.map((s) => el("option", { value: s.symbol, text: `${s.name} (${s.symbol}) · ${s.latest_close} 元` })),
+    );
+    if (curForecast && stocks.some((s) => s.symbol === curForecast)) {
+      forecastSel.value = curForecast;
+    }
   }
 
   // 若目前模擬交易下拉為核心自選清單，同步更新選項
@@ -574,13 +628,19 @@ function syncSymbolSelects(stocks) {
 function renderOrderSymbolOptionsFromWatchlist(preferredSymbol = null) {
   const orderSel = document.getElementById("order-symbol");
   const curOrder = preferredSymbol || orderSel.value;
-  orderSel.replaceChildren(
-    ...state.stocks.map((s) => el("option", { value: s.symbol, text: `${s.symbol} · ${s.name} (${s.latest_close} 元)` })),
-  );
-  if (curOrder && state.stocks.some((s) => s.symbol === curOrder)) {
-    orderSel.value = curOrder;
+  const existingKeys = [...orderSel.options].map((o) => o.value).join(",");
+  const nextKeys = state.stocks.map((s) => s.symbol).join(",");
+  if (preferredSymbol || document.activeElement !== orderSel || existingKeys !== nextKeys) {
+    orderSel.replaceChildren(
+      ...state.stocks.map((s) => el("option", { value: s.symbol, text: `${s.symbol} · ${s.name} (${s.latest_close} 元)` })),
+    );
+    if (curOrder && state.stocks.some((s) => s.symbol === curOrder)) {
+      orderSel.value = curOrder;
+    }
   }
-  if (!document.getElementById("order-price").value || preferredSymbol) {
+  const priceInput = document.getElementById("order-price");
+  const isEditingPrice = document.activeElement === priceInput;
+  if ((!priceInput.value && !isEditingPrice) || preferredSymbol) {
     prefillPriceForSelected();
   }
 }
@@ -1091,54 +1151,56 @@ function buildScheduleEditor(cronExpr) {
 
 function renderSchedules(data) {
   const schedBody = document.getElementById("schedules-body");
-  schedBody.replaceChildren(
-    ...data.schedules.map((s) => {
-      const editor = buildScheduleEditor(s.cron_expr);
-      const enabledChk = el("input", { type: "checkbox" });
-      enabledChk.checked = Boolean(s.enabled);
-      const friendlyName = JOB_LABELS[s.job_name] || s.job_name;
+  if (!schedBody.contains(document.activeElement)) {
+    schedBody.replaceChildren(
+      ...data.schedules.map((s) => {
+        const editor = buildScheduleEditor(s.cron_expr);
+        const enabledChk = el("input", { type: "checkbox" });
+        enabledChk.checked = Boolean(s.enabled);
+        const friendlyName = JOB_LABELS[s.job_name] || s.job_name;
 
-      return el("tr", {}, [
-        el("td", { class: "wrap-cell" }, [
-          el("strong", { text: friendlyName }),
-          el("div", { class: "muted-text", style: "font-size: 0.76rem;", text: s.description }),
-        ]),
-        el("td", {}, [editor.root]),
-        el("td", {}, [enabledChk]),
-        el("td", {}, [
-          el("div", { class: "btn-group" }, [
-            el("button", {
-              class: "btn btn-ghost btn-sm",
-              type: "button",
-              text: "儲存",
-              onclick: async () => {
-                const fb = document.getElementById("schedule-feedback");
-                const res = await api(`/api/schedules/${encodeURIComponent(s.job_name)}`, {
-                  method: "PUT",
-                  body: JSON.stringify({ cron_expr: editor.getCron(), enabled: enabledChk.checked }),
-                });
-                fb.textContent = res.ok ? `已更新「${friendlyName}」排程設定。` : `更新失敗：${res.data.error}`;
-                if (res.ok) await loadSchedules();
-              },
-            }),
-            el("button", {
-              class: "btn btn-primary btn-sm",
-              type: "button",
-              text: "立即執行",
-              onclick: async () => {
-                const fb = document.getElementById("schedule-feedback");
-                const res = await api(`/api/schedules/${encodeURIComponent(s.job_name)}/run`, { method: "POST" });
-                fb.textContent = res.ok
-                  ? `已手動執行「${friendlyName}」：${STATUS_LABELS[res.data.status] || res.data.status}，處理 ${res.data.records_processed} 筆 (${res.data.duration_ms} ms)`
-                  : `執行失敗：${res.data.error}`;
-                await Promise.all([loadOverview(), loadSchedules()]);
-              },
-            }),
+        return el("tr", {}, [
+          el("td", { class: "wrap-cell" }, [
+            el("strong", { text: friendlyName }),
+            el("div", { class: "muted-text", style: "font-size: 0.76rem;", text: s.description }),
           ]),
-        ]),
-      ]);
-    }),
-  );
+          el("td", {}, [editor.root]),
+          el("td", {}, [enabledChk]),
+          el("td", {}, [
+            el("div", { class: "btn-group" }, [
+              el("button", {
+                class: "btn btn-ghost btn-sm",
+                type: "button",
+                text: "儲存",
+                onclick: async () => {
+                  const fb = document.getElementById("schedule-feedback");
+                  const res = await api(`/api/schedules/${encodeURIComponent(s.job_name)}`, {
+                    method: "PUT",
+                    body: JSON.stringify({ cron_expr: editor.getCron(), enabled: enabledChk.checked }),
+                  });
+                  fb.textContent = res.ok ? `已更新「${friendlyName}」排程設定。` : `更新失敗：${res.data.error}`;
+                  if (res.ok) await loadSchedules();
+                },
+              }),
+              el("button", {
+                class: "btn btn-primary btn-sm",
+                type: "button",
+                text: "立即執行",
+                onclick: async () => {
+                  const fb = document.getElementById("schedule-feedback");
+                  const res = await api(`/api/schedules/${encodeURIComponent(s.job_name)}/run`, { method: "POST" });
+                  fb.textContent = res.ok
+                    ? `已手動執行「${friendlyName}」：${STATUS_LABELS[res.data.status] || res.data.status}，處理 ${res.data.records_processed} 筆 (${res.data.duration_ms} ms)`
+                    : `執行失敗：${res.data.error}`;
+                  await Promise.all([loadOverview(), loadSchedules()]);
+                },
+              }),
+            ]),
+          ]),
+        ]);
+      }),
+    );
+  }
 
   const logsBody = document.getElementById("logs-body");
   if (!data.logs.length) {
@@ -1433,15 +1495,28 @@ function wireEvents() {
   });
 
   document.getElementById("btn-refresh-market").addEventListener("click", async () => {
-    await api("/api/schedules/fetch_post_market/run", { method: "POST" });
-    await Promise.all([loadOverview(), loadSchedules(), loadRealityCheck()]);
+    state.liveRefreshing = true;
+    renderLiveSyncStatus();
+    try {
+      await api("/api/schedules/fetch_post_market/run", { method: "POST" });
+      await Promise.all([loadOverview(), loadSchedules(), loadRealityCheck()]);
+    } finally {
+      state.liveRefreshing = false;
+      await pollLiveStatus();
+      renderLiveSyncStatus();
+    }
   });
 
   document.getElementById("live-interval-select").addEventListener("change", async (e) => {
     const val = Number(e.target.value);
     const body = val === 0 ? { enabled: false } : { enabled: true, interval_sec: val };
     const res = await api("/api/live", { method: "POST", body: JSON.stringify(body) });
-    if (res.ok) updateLiveBadge(res.data);
+    if (res.ok) {
+      applyLivePayload(res.data);
+      if (res.data.enabled) {
+        setTimeout(() => pollLiveStatus(), 1800);
+      }
+    }
   });
 
   document.addEventListener("visibilitychange", () => {
@@ -1732,38 +1807,173 @@ function startSyncPolling() {
 function updateLiveBadge(live) {
   const dot = document.getElementById("live-dot");
   const sel = document.getElementById("live-interval-select");
-  dot.classList.toggle("paused", !live.enabled);
-  sel.value = live.enabled ? String(live.interval_sec) : "0";
+  const statusUpper = String(live.last_status || "").toUpperCase();
+  const isSyncing = state.liveRefreshing || Boolean(live.ticking) || statusUpper === "RUNNING" || statusUpper === "SYNCING";
+  dot.classList.toggle("paused", !live.enabled && !isSyncing);
+  dot.classList.toggle("syncing", isSyncing);
+  if (document.activeElement !== sel) {
+    sel.value = live.enabled ? String(live.interval_sec) : "0";
+  }
 }
 
-async function pollLiveStatus() {
-  if (document.hidden) return;
-  const res = await api("/api/live");
-  if (!res.ok) return;
-  const live = res.data;
+function applyLivePayload(live) {
+  state.liveState = live;
+  if (live.server_time) {
+    const serverMs = Date.parse(live.server_time);
+    if (!Number.isNaN(serverMs)) {
+      state.serverClockOffsetMs = serverMs - Date.now();
+    }
+  }
   updateLiveBadge(live);
+  renderLiveSyncStatus();
+}
 
-  if (state.lastDataVersion === null) {
-    state.lastDataVersion = live.data_version;
+function renderLiveSyncStatus() {
+  const pill = document.getElementById("live-sync-status");
+  if (!pill) return;
+  const live = state.liveState;
+  if (!live) {
+    pill.textContent = "同步檢查中...";
     return;
   }
 
-  if (live.data_version > state.lastDataVersion) {
-    state.lastDataVersion = live.data_version;
-    const pill = document.getElementById("latest-quote-pill");
-    pill.classList.add("flash-updated");
-    setTimeout(() => pill.classList.remove("flash-updated"), 1200);
+  updateLiveBadge(live);
+  const statusUpper = String(live.last_status || "").toUpperCase();
+  const isBackendSyncing = Boolean(live.ticking) || statusUpper === "RUNNING" || statusUpper === "SYNCING";
+  const isSyncing = state.liveRefreshing || isBackendSyncing;
+  const lastTimeStr = live.last_tick_at ? formatTaipeiTime(live.last_tick_at) : "";
 
+  let remainSec = null;
+  if (live.enabled && live.next_tick_at) {
+    const nextMs = Date.parse(live.next_tick_at);
+    if (!Number.isNaN(nextMs)) {
+      const nowServerMs = Date.now() + state.serverClockOffsetMs;
+      remainSec = Math.max(0, Math.ceil((nextMs - nowServerMs) / 1000));
+    }
+  }
+
+  pill.classList.remove("is-syncing", "is-paused", "is-error");
+
+  if (isSyncing) {
+    pill.classList.add("is-syncing");
+    pill.textContent = "自動同步中...";
+    pill.title = "正在向行情來源拉取最新報價並更新畫面";
+    return;
+  }
+
+  if (!live.enabled) {
+    pill.classList.add("is-paused");
+    pill.textContent = lastTimeStr ? `已同步 ${lastTimeStr} · 自動更新已暫停` : "自動更新已暫停";
+    pill.title = "可在右側切換自動更新頻率以恢復定時同步";
+    return;
+  }
+
+  const hasError = statusUpper === "FAILED" || (Boolean(live.last_error) && statusUpper !== "SUCCESS");
+  if (hasError) {
+    pill.classList.add("is-error");
+    const retryPart = remainSec !== null && remainSec > 0 ? `${remainSec}s 後重試` : "即將重試";
+    pill.textContent = `同步異常 · ${retryPart}`;
+    pill.title = `上次同步訊息：${live.last_error || statusUpper}`;
+  } else if (lastTimeStr) {
+    const nextPart = remainSec === null
+      ? `${live.interval_sec}s 輪詢`
+      : (remainSec > 0 ? `${remainSec}s 後更新` : "即將更新");
+    pill.textContent = `已同步 ${lastTimeStr} · ${nextPart}`;
+    pill.title = `台北時間上次同步：${lastTimeStr}（第 ${live.tick_count || 0} 次同步）`;
+  } else {
+    const nextPart = remainSec !== null && remainSec > 0 ? `${remainSec}s 後首次同步` : "首次同步準備中...";
+    pill.textContent = nextPart;
+    pill.title = "伺服器啟動後將自動執行首次行情同步";
+  }
+
+  if (live.enabled && remainSec === 0 && !state.livePollInFlight && !document.hidden) {
+    const nowMs = Date.now();
+    if (nowMs - state.lastZeroPollAt >= 2500) {
+      state.lastZeroPollAt = nowMs;
+      pollLiveStatus();
+    }
+  }
+}
+
+function flashSyncIndicators() {
+  ["live-sync-status", "latest-quote-pill"].forEach((id) => {
+    const node = document.getElementById(id);
+    if (!node) return;
+    node.classList.add("flash-updated");
+    setTimeout(() => node.classList.remove("flash-updated"), 1200);
+  });
+}
+
+async function refreshAllLiveViews() {
+  state.liveRefreshing = true;
+  renderLiveSyncStatus();
+  flashSyncIndicators();
+  try {
     const tasks = [loadOverview(), loadSchedules(), loadRealityCheck()];
     if (document.getElementById("tab-classes").classList.contains("active") && state.selectedCategoryKey) {
       tasks.push(loadCategoryQuotes(state.selectedCategoryKey, true));
     }
     await Promise.all(tasks);
+  } finally {
+    state.liveRefreshing = false;
+    renderLiveSyncStatus();
+  }
+}
+
+async function pollLiveStatus() {
+  if (document.hidden || state.livePollInFlight) return;
+  state.livePollInFlight = true;
+  try {
+    const res = await api("/api/live");
+    if (!res.ok) return;
+    const live = res.data;
+    applyLivePayload(live);
+
+    if (live.sync_status && live.sync_status.running) {
+      startSyncPolling();
+    }
+
+    const nextVer = isFiniteNum(live.data_version) ? Number(live.data_version) : 0;
+    const nextTick = isFiniteNum(live.tick_count) ? Number(live.tick_count) : 0;
+    const nextTickAt = live.last_tick_at || null;
+
+    if (state.lastDataVersion === null) {
+      state.lastDataVersion = nextVer;
+      state.lastTickCount = nextTick;
+      state.lastTickAt = nextTickAt;
+
+      const tickMs = nextTickAt ? Date.parse(nextTickAt) : NaN;
+      const tickCompletedAfterInit = !Number.isNaN(tickMs) && state.initialOverviewLoadedAt > 0
+        && tickMs >= state.initialOverviewLoadedAt - 1000;
+      if (tickCompletedAfterInit && nextTick > 0) {
+        await refreshAllLiveViews();
+      } else if (live.enabled && nextTick === 0) {
+        setTimeout(() => pollLiveStatus(), 2000);
+      }
+      return;
+    }
+
+    const versionChanged = nextVer > state.lastDataVersion;
+    const tickChanged = nextTick > (state.lastTickCount ?? 0);
+    const tickTimeChanged = Boolean(nextTickAt) && nextTickAt !== state.lastTickAt;
+
+    if (versionChanged || tickChanged || tickTimeChanged) {
+      state.lastDataVersion = nextVer;
+      state.lastTickCount = nextTick;
+      state.lastTickAt = nextTickAt;
+      await refreshAllLiveViews();
+    } else if (live.ticking) {
+      setTimeout(() => pollLiveStatus(), 1500);
+    }
+  } finally {
+    state.livePollInFlight = false;
   }
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
   wireEvents();
+  state.initialOverviewLoadedAt = Date.now();
   await Promise.all([loadOverview(), loadSchedules(), loadRealityCheck(), loadClasses(), pollLiveStatus()]);
+  setInterval(renderLiveSyncStatus, 1000);
   setInterval(pollLiveStatus, 5000);
 });

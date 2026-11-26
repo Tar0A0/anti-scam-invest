@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import math
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 from urllib.parse import quote as url_quote
 from urllib.request import Request, urlopen
@@ -11,10 +12,25 @@ from urllib.request import Request, urlopen
 from app.adapters.base import Quote
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) StockMate/1.0"
+TAIPEI_TZ = timezone(timedelta(hours=8))
+
+
+def _finite_positive_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    val = float(value)
+    return val if math.isfinite(val) and val > 0 else None
+
+
+def _finite_nonneg_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    val = float(value)
+    return int(val) if math.isfinite(val) and val >= 0 else None
 
 
 def parse_yahoo_chart_payload(symbol: str, payload: dict[str, Any]) -> list[Quote]:
-    """解析 Yahoo Finance `/v8/finance/chart` JSON 回應並轉為標準化 Quote 清單。"""
+    """解析 Yahoo Finance `/v8/finance/chart` JSON 回應並轉為標準化 Quote 清單（含 meta 最新報價補齊）。"""
     chart = payload.get("chart") or {}
     if chart.get("error"):
         err = chart["error"]
@@ -35,21 +51,31 @@ def parse_yahoo_chart_payload(symbol: str, payload: dict[str, Any]) -> list[Quot
 
     # 依時間戳記去重（若同一交易日同時含收盤與盤中最新點，保留較後面那筆）
     by_ts: dict[int, Quote] = {}
+    # 記錄各台北交易日原始 timestamp 與非空 open，供 meta 補齊／更新同日 K 棒使用
+    raw_day_ts: dict[date, int] = {}
+    raw_day_open: dict[date, float] = {}
     for idx, ts in enumerate(timestamps):
         if ts is None:
             continue
+        ts_int = int(ts)
+        q_time = datetime.fromtimestamp(ts_int, tz=timezone.utc)
+        tpe_day = q_time.astimezone(TAIPEI_TZ).date()
+        raw_day_ts.setdefault(tpe_day, ts_int)
+
         o = opens[idx] if idx < len(opens) else None
         h = highs[idx] if idx < len(highs) else None
         l_val = lows[idx] if idx < len(lows) else None
         c = closes[idx] if idx < len(closes) else None
         v = volumes[idx] if idx < len(volumes) else None
 
+        parsed_o = _finite_positive_float(o)
+        if parsed_o is not None:
+            raw_day_open.setdefault(tpe_day, parsed_o)
+
         # 跳過休市或尚未成交完成的殘缺 K 棒
         if any(x is None for x in (o, h, l_val, c)):
             continue
 
-        ts_int = int(ts)
-        q_time = datetime.fromtimestamp(ts_int, tz=timezone.utc)
         by_ts[ts_int] = Quote(
             symbol=symbol,
             quote_time=q_time,
@@ -61,7 +87,81 @@ def parse_yahoo_chart_payload(symbol: str, payload: dict[str, Any]) -> list[Quot
             source="yahoo",
         )
 
-    return [by_ts[k] for k in sorted(by_ts.keys())]
+    quotes = [by_ts[k] for k in sorted(by_ts.keys())]
+
+    # 補齊或更新 meta.regularMarketPrice / regularMarketTime（解決日線陣列落後一天或盤中尚未更新問題）
+    meta = first.get("meta") or {}
+    rm_ts = _finite_nonneg_int(meta.get("regularMarketTime"))
+    rm_price = _finite_positive_float(meta.get("regularMarketPrice"))
+    if rm_ts and rm_price is not None:
+        rm_dt = datetime.fromtimestamp(rm_ts, tz=timezone.utc)
+        rm_tpe_day = rm_dt.astimezone(TAIPEI_TZ).date()
+        rm_high = _finite_positive_float(meta.get("regularMarketDayHigh"))
+        rm_low = _finite_positive_float(meta.get("regularMarketDayLow"))
+        rm_vol = _finite_nonneg_int(meta.get("regularMarketVolume"))
+
+        # 查找最後一筆同台北交易日 K 棒
+        same_day_idx: int | None = None
+        for idx in range(len(quotes) - 1, -1, -1):
+            if quotes[idx].quote_time.astimezone(TAIPEI_TZ).date() == rm_tpe_day:
+                same_day_idx = idx
+                break
+
+        if same_day_idx is not None:
+            # 同一台北交易日：保留原 quote_time 與 open，原地更新最新 OHLCV（避免資料庫同日產生兩筆重複日線）
+            existing = quotes[same_day_idx]
+            open_p = existing.open
+            high_candidates = [existing.high, open_p, rm_price]
+            low_candidates = [existing.low, open_p, rm_price]
+            if rm_high is not None:
+                high_candidates.append(rm_high)
+            if rm_low is not None:
+                low_candidates.append(rm_low)
+            high_p = round(max(high_candidates), 4)
+            low_p = round(min(low_candidates), 4)
+            close_p = round(rm_price, 4)
+            vol = rm_vol if (rm_vol is not None and rm_vol > 0) else existing.volume
+            quotes[same_day_idx] = Quote(
+                symbol=symbol,
+                quote_time=existing.quote_time,
+                open=open_p,
+                high=high_p,
+                low=low_p,
+                close=close_p,
+                volume=vol,
+                source="yahoo",
+            )
+        elif not quotes or rm_tpe_day > quotes[-1].quote_time.astimezone(TAIPEI_TZ).date():
+            # 更新的台北交易日：補上今日 K 棒
+            open_p = raw_day_open.get(rm_tpe_day, rm_price)
+            high_candidates = [open_p, rm_price]
+            low_candidates = [open_p, rm_price]
+            if rm_high is not None:
+                high_candidates.append(rm_high)
+            if rm_low is not None:
+                low_candidates.append(rm_low)
+            high_p = round(max(high_candidates), 4)
+            low_p = round(min(low_candidates), 4)
+            bar_time = (
+                datetime.fromtimestamp(raw_day_ts[rm_tpe_day], tz=timezone.utc)
+                if rm_tpe_day in raw_day_ts
+                else rm_dt
+            )
+            if not quotes or bar_time > quotes[-1].quote_time:
+                quotes.append(
+                    Quote(
+                        symbol=symbol,
+                        quote_time=bar_time,
+                        open=round(open_p, 4),
+                        high=high_p,
+                        low=low_p,
+                        close=round(rm_price, 4),
+                        volume=rm_vol if rm_vol is not None else 0,
+                        source="yahoo",
+                    )
+                )
+
+    return quotes
 
 
 class YahooFinanceAdapter:

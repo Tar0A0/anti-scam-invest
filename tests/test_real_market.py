@@ -136,6 +136,178 @@ class RealMarketTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_parse_yahoo_appends_newer_trading_day_from_meta(self) -> None:
+        # Case A：indicators.quote[0] 停在 2026-11-25，meta 已有 2026-11-26 最新收盤／盤中報價
+        ts_nov25 = int(datetime(2026, 11, 25, 1, 0, tzinfo=timezone.utc).timestamp())
+        ts_nov26_meta = int(datetime(2026, 11, 26, 5, 30, 1, tzinfo=timezone.utc).timestamp())
+        payload = {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {
+                            "regularMarketTime": ts_nov26_meta,
+                            "regularMarketPrice": 2145.0,
+                            "regularMarketDayHigh": 2170.0,
+                            "regularMarketDayLow": 2120.0,
+                            "regularMarketVolume": 44368303,
+                        },
+                        "timestamp": [ts_nov25],
+                        "indicators": {
+                            "quote": [
+                                {
+                                    "open": [2100.0],
+                                    "high": [2130.0],
+                                    "low": [2090.0],
+                                    "close": [2120.0],
+                                    "volume": [35000000],
+                                }
+                            ]
+                        },
+                    }
+                ],
+                "error": None,
+            }
+        }
+
+        quotes = parse_yahoo_chart_payload("2330.TW", payload)
+        self.assertEqual(len(quotes), 2)
+        latest = quotes[-1]
+        self.assertEqual(latest.quote_time, datetime.fromtimestamp(ts_nov26_meta, tz=timezone.utc))
+        self.assertAlmostEqual(latest.close, 2145.0)
+        self.assertAlmostEqual(latest.high, 2170.0)
+        self.assertAlmostEqual(latest.low, 2120.0)
+        self.assertEqual(latest.volume, 44368303)
+        self.assertLessEqual(latest.low, min(latest.open, latest.close))
+        self.assertGreaterEqual(latest.high, max(latest.open, latest.close))
+
+        val = validate_quotes(quotes, now=datetime(2026, 11, 26, 6, 0, tzinfo=timezone.utc))
+        self.assertEqual(val.status, "SUCCESS")
+        self.assertEqual(len(val.valid_quotes), 2)
+
+        # Case A-2：若 2026-11-26 在 indicators 僅有殘缺 bar（含 open 但缺 high/low/close），應沿用該 open 與 timestamp
+        ts_nov26_open = int(datetime(2026, 11, 26, 1, 0, tzinfo=timezone.utc).timestamp())
+        payload_partial = {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {
+                            "regularMarketTime": ts_nov26_meta,
+                            "regularMarketPrice": 2145.0,
+                            "regularMarketDayHigh": 2170.0,
+                            "regularMarketDayLow": 2120.0,
+                            "regularMarketVolume": 44368303,
+                        },
+                        "timestamp": [ts_nov25, ts_nov26_open],
+                        "indicators": {
+                            "quote": [
+                                {
+                                    "open": [2100.0, 2135.0],
+                                    "high": [2130.0, None],
+                                    "low": [2090.0, None],
+                                    "close": [2120.0, None],
+                                    "volume": [35000000, None],
+                                }
+                            ]
+                        },
+                    }
+                ],
+                "error": None,
+            }
+        }
+        quotes_partial = parse_yahoo_chart_payload("2330.TW", payload_partial)
+        self.assertEqual(len(quotes_partial), 2)
+        self.assertEqual(quotes_partial[-1].quote_time, datetime.fromtimestamp(ts_nov26_open, tz=timezone.utc))
+        self.assertAlmostEqual(quotes_partial[-1].open, 2135.0)
+        self.assertAlmostEqual(quotes_partial[-1].close, 2145.0)
+
+    def test_parse_yahoo_updates_same_trading_day_in_place_from_meta(self) -> None:
+        # Case B：indicators 已有 2026-11-26 K 棒，meta 盤中／收盤更新價量時原地更新且不重複新增同日 K 棒
+        ts_nov25 = int(datetime(2026, 11, 25, 1, 0, tzinfo=timezone.utc).timestamp())
+        ts_nov26_bar = int(datetime(2026, 11, 26, 1, 0, tzinfo=timezone.utc).timestamp())
+        ts_nov26_meta = int(datetime(2026, 11, 26, 5, 30, 1, tzinfo=timezone.utc).timestamp())
+        payload_before = {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {
+                            "regularMarketTime": ts_nov26_meta,
+                            "regularMarketPrice": 2140.0,
+                            "regularMarketDayHigh": 2150.0,
+                            "regularMarketDayLow": 2125.0,
+                            "regularMarketVolume": 20000000,
+                        },
+                        "timestamp": [ts_nov25, ts_nov26_bar],
+                        "indicators": {
+                            "quote": [
+                                {
+                                    "open": [2100.0, 2130.0],
+                                    "high": [2130.0, 2145.0],
+                                    "low": [2090.0, 2125.0],
+                                    "close": [2120.0, 2135.0],
+                                    "volume": [35000000, 18000000],
+                                }
+                            ]
+                        },
+                    }
+                ],
+                "error": None,
+            }
+        }
+        payload_after = {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {
+                            "regularMarketTime": ts_nov26_meta + 60,
+                            "regularMarketPrice": 2165.0,
+                            "regularMarketDayHigh": 2175.0,
+                            "regularMarketDayLow": 2120.0,
+                            "regularMarketVolume": 44368303,
+                        },
+                        "timestamp": [ts_nov25, ts_nov26_bar],
+                        "indicators": {
+                            "quote": [
+                                {
+                                    "open": [2100.0, 2130.0],
+                                    "high": [2130.0, 2145.0],
+                                    "low": [2090.0, 2125.0],
+                                    "close": [2120.0, 2135.0],
+                                    "volume": [35000000, 18000000],
+                                }
+                            ]
+                        },
+                    }
+                ],
+                "error": None,
+            }
+        }
+
+        now_ref = datetime(2026, 11, 26, 6, 0, tzinfo=timezone.utc)
+        q1 = parse_yahoo_chart_payload("2330.TW", payload_before)
+        q2 = parse_yahoo_chart_payload("2330.TW", payload_after)
+        self.assertEqual(len(q1), 2)
+        self.assertEqual(len(q2), 2)
+        # 維持原本 2026-11-26 K 棒的 quote_time 與 open，原地更新最新 close/high/low/volume
+        self.assertEqual(q2[-1].quote_time, datetime.fromtimestamp(ts_nov26_bar, tz=timezone.utc))
+        self.assertAlmostEqual(q2[-1].open, 2130.0)
+        self.assertAlmostEqual(q2[-1].high, 2175.0)
+        self.assertAlmostEqual(q2[-1].low, 2120.0)
+        self.assertAlmostEqual(q2[-1].close, 2165.0)
+        self.assertEqual(q2[-1].volume, 44368303)
+
+        conn = get_connection(self.db_path)
+        try:
+            save_validated_quotes(conn, validate_quotes(q1, now=now_ref))
+            save_validated_quotes(conn, validate_quotes(q2, now=now_ref))
+            rows = conn.execute(
+                "SELECT quote_time, open, high, low, close, volume FROM market_quotes WHERE symbol = '2330.TW' AND source = 'yahoo' ORDER BY quote_time ASC;"
+            ).fetchall()
+            self.assertEqual(len(rows), 2)
+            self.assertAlmostEqual(rows[-1]["close"], 2165.0)
+            self.assertEqual(rows[-1]["volume"], 44368303)
+        finally:
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

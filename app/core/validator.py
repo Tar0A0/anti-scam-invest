@@ -188,7 +188,7 @@ def validate_quotes(
 
 
 def save_validated_quotes(conn: sqlite3.Connection, result: ValidationResult) -> int:
-    """僅將通過驗證的報價寫入 market_quotes 資料表，回傳實際新增筆數。"""
+    """將通過驗證的報價寫入或更新至 market_quotes 資料表，回傳寫入／更新筆數。"""
     if not result.valid_quotes:
         return 0
 
@@ -208,9 +208,15 @@ def save_validated_quotes(conn: sqlite3.Connection, result: ValidationResult) ->
     with conn:
         cursor = conn.executemany(
             """
-            INSERT OR IGNORE INTO market_quotes
+            INSERT INTO market_quotes
                 (symbol, source, quote_time, open, high, low, close, volume)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, source, quote_time) DO UPDATE SET
+                open = excluded.open,
+                high = excluded.high,
+                low = excluded.low,
+                close = excluded.close,
+                volume = excluded.volume;
             """,
             rows,
         )

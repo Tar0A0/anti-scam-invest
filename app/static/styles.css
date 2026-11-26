@@ -202,14 +202,15 @@ body {
 }
 
 .topbar {
-  height: 54px;
+  min-height: 54px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
-  padding: 0 24px;
+  padding: 8px 24px;
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 10px 12px;
   position: sticky;
   top: 0;
   z-index: 20;
@@ -218,7 +219,8 @@ body {
 .topbar-left {
   display: flex;
   align-items: center;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 8px 10px;
   min-width: 0;
 }
 
@@ -266,11 +268,29 @@ body {
   background: var(--down);
   animation: livePulse 2.4s ease-in-out infinite;
 }
+.live-dot.syncing { background: var(--accent); animation: livePulse 0.9s ease-in-out infinite; }
 .live-dot.paused { background: var(--muted); animation: none; }
 
 @keyframes livePulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
+}
+
+.live-sync-pill {
+  transition: border-color 180ms ease, color 180ms ease, background-color 180ms ease;
+}
+.live-sync-pill.is-syncing {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-tint);
+}
+.live-sync-pill.is-paused {
+  color: var(--muted);
+}
+.live-sync-pill.is-error {
+  border-color: var(--warn-border);
+  color: var(--warn);
+  background: var(--warn-bg);
 }
 
 .mono-pill.flash-updated {
